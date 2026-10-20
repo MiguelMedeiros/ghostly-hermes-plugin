@@ -1,0 +1,27 @@
+{
+  "<owner chat id>": {
+    "label": "owner",
+    "name": "<owner's name>",
+    "role": "owner"
+  },
+  "<another agent's chat id>": {
+    "label": "coordinator",
+    "name": "<that agent's name>",
+    "role": "agent_peer"
+  },
+  "<a friend's chat id>": {
+    "label": "friend",
+    "name": "<their name>",
+    "role": "contact"
+  },
+  "group:<group id>": {
+    "label": "team",
+    "name": "the team group",
+    "role": "group",
+    "mentions_only": true,
+    "members": {
+      "<owner's member key>": { "name": "<owner's name>", "owner": true },
+      "<another agent's member key>": { "name": "<that agent's name>" }
+    }
+  }
+}

@@ -1,0 +1,21 @@
+# Optional (Linux): keeps the Ghostly CLI daemon up as a user service, so the plugin always has a profile online.
+#   cp systemd/ghostly-daemon.service ~/.config/systemd/user/
+#   edit ExecStart to the output of `command -v ghostly` (and PATH, so it reaches node)
+#   systemctl --user daemon-reload && systemctl --user enable --now ghostly-daemon
+#   loginctl enable-linger "$USER"   # keeps it running without a login session
+[Unit]
+Description=Ghostly CLI daemon (default profile)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+Environment=PATH=%h/.local/bin:/usr/local/bin:/usr/bin:/bin
+ExecStart=/usr/local/bin/ghostly daemon
+Restart=always
+RestartSec=5
+TimeoutStopSec=30
+KillMode=control-group
+
+[Install]
+WantedBy=default.target

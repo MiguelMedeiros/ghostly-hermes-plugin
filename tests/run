@@ -1,0 +1,41 @@
+#!/usr/bin/env bash
+# The repo's test command: runs tests/ with the Hermes Agent's own Python, against its real gateway code.
+#
+#   tests/run [pytest args]
+#
+# HERMES_AGENT_DIR  the Hermes Agent checkout (default ~/.hermes/hermes-agent)
+# HERMES_PYTHON     that install's Python, if the lookup below does not find it
+#
+# pytest goes into .tests-deps/ (gitignored), never into Hermes' own environment.
+set -euo pipefail
+cd "$(dirname "$0")/.."
+root="$PWD"
+agent="${HERMES_AGENT_DIR:-$HOME/.hermes/hermes-agent}"
+[ -d "$agent/gateway" ] || { echo "tests/run: no Hermes Agent at $agent (set HERMES_AGENT_DIR)" >&2; exit 1; }
+
+py="${HERMES_PYTHON:-}"
+if [ -z "$py" ]; then
+  for c in "$agent/.venv/bin/python" "$agent/venv/bin/python"; do
+    [ -x "$c" ] && { py="$c"; break; }
+  done
+fi
+if [ -z "$py" ] && command -v hermes >/dev/null 2>&1; then
+  # Newer installs keep their dependencies in a managed venv: ask the runtime where it is.
+  venv="$(hermes --run-module site 2>/dev/null | sed -n "s#^ *'\(.*/venv\)/lib/python[^/]*/site-packages',\$#\1#p" | head -n 1)"
+  [ -n "$venv" ] && [ -x "$venv/bin/python" ] && py="$venv/bin/python"
+fi
+[ -n "$py" ] || { echo "tests/run: could not find the Hermes Agent's Python (set HERMES_PYTHON)" >&2; exit 1; }
+
+deps="$root/.tests-deps"
+if ! PYTHONPATH="$deps" "$py" -c 'import pytest' >/dev/null 2>&1; then
+  uv="$(command -v uv || ls "$HOME"/.hermes/tools/uv-*/uv 2>/dev/null | head -n 1 || true)"
+  if [ -n "$uv" ]; then
+    "$uv" pip install --quiet --python "$py" --target "$deps" pytest
+  else
+    "$py" -m pip install --quiet --target "$deps" pytest
+  fi
+fi
+
+cd "$root/tests"
+PYTHONPATH="$agent:$deps" HERMES_AGENT_DIR="$agent" \
+  exec "$py" -m pytest --import-mode=importlib -q -p no:cacheprovider "$@" .

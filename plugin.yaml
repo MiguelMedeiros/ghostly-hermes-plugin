@@ -1,0 +1,20 @@
+name: ghostly-platform
+label: Ghostly
+kind: platform
+version: 1.0.0
+description: >
+  Ghostly as a Hermes gateway platform. Your Hermes chats on the Ghostly peer-to-peer messenger through the local
+  `ghostly` CLI (its profile daemon must be running): allowlisted DMs and groups become gateway sessions, replies,
+  edits, files, approvals as buttons, a 👀 on the owner's messages and a thinking status while it works. Cron jobs
+  and send_message can deliver to a Ghostly chat too.
+author: Miguel Medeiros
+requires_env:
+  - name: GHOSTLY_HOME_CHANNEL
+    description: "Ghostly chat label or id that receives notifications (e.g. owner)"
+    prompt: "Ghostly home chat"
+    password: false
+optional_env:
+  - name: GHOSTLY_BIN
+    description: "Path to the ghostly CLI (default: ghostly on PATH)"
+    prompt: "ghostly binary path (or empty)"
+    password: false

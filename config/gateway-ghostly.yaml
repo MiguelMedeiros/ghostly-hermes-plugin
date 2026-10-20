@@ -1,0 +1,44 @@
+# Hermes gateway settings for the Ghostly platform. Merge these keys into ~/.hermes/config.yaml
+# (or set them one by one with `hermes config set <key> <value>`). No secrets here.
+#
+# After merging, restart the gateway from your own shell, never from inside an agent turn.
+
+plugins:
+  enabled:
+    - ghostly-platform               # add to your existing list; `hermes plugins enable ghostly-platform` does it too
+
+platforms:
+  ghostly:
+    enabled: true
+    extra:
+      inbound: true                  # read chats and groups (off: send-only, for cron and send_message)
+      owner_name: "<your owner's name>"   # how the prompts name the owner (default "the owner")
+      agent_name: "Hermes"           # how the prompts name this agent
+      # chats_file: ~/.hermes/ghostly-platform/chats.json          (the default)
+      # owner_keys_file: ~/.hermes/ghostly-platform/owner_keys.txt (the default)
+      # profiles: []                 # more Ghostly profiles to listen to
+
+# Recommended display settings for a chat app: the text between tool calls goes out as it is written,
+# the progress bubble is edited in place, and Markdown is stripped (Ghostly shows it as raw symbols).
+display:
+  interim_assistant_messages: true
+  tool_progress: all
+  tool_progress_grouping: accumulate
+  tool_progress_command: false
+  tool_preview_length: 0
+  cleanup_progress: false
+  final_response_markdown: strip
+  show_reasoning: false
+
+streaming:
+  enabled: false                     # one final message, not a stream of edits
+
+group_sessions_per_user: true
+
+# Optional: voice notes in (speech to text) and out (text to speech). Any provider Hermes supports works;
+# keys go in ~/.hermes/.env, never in this file.
+# stt:
+#   enabled: true
+#   provider: local
+# tts:
+#   provider: elevenlabs
