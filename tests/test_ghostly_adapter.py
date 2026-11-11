@@ -28,7 +28,8 @@ case "$1 $2" in
   "chat list") cat "$dir/chats.json";;
   "group show") cat "$dir/group.json";;
   "file save") shift 2; p=""; while [ $# -gt 0 ]; do [ "$1" = "--path" ] && p="$2"; shift; done; echo data > "$p"; echo '{"saved":true}';;
-  "listen "*) if [ -n "$prof" ]; then cat "$dir/events-$prof.jsonl"; else cat "$dir/events.jsonl"; fi;;
+  "listen "*) if [ -f "$dir/listen-error" ]; then cat "$dir/listen-error" >&2; exit 1; fi
+             if [ -n "$prof" ]; then cat "$dir/events-$prof.jsonl"; else cat "$dir/events.jsonl"; fi;;
   *) if [ "$1" = "send" ] && printf '%s' "$stdin" | grep -q SECRETSEED; then echo '{"error":{"code":"secret"}}'; exit 5; fi
      echo '{"messageId":"m1","delivery":"sent"}';;
 esac
@@ -429,6 +430,32 @@ def test_first_listen_starts_at_the_current_seq_and_advances_the_cursor(env):
     listen = next(c for c in calls(tmp) if c[0] == "listen")
     assert listen[listen.index("--since") + 1] == "41"
     assert adapter._read_cursor() == 42 and captured[0].text == "new"
+
+
+def test_a_failing_listen_logs_the_clis_reason_and_retries_at_most_every_retry_max(env, monkeypatch, caplog):
+    """While the daemon is down every ``listen`` fails: the log says why, and the retries stay frequent enough that the
+    owner's first message after the daemon is back is read within RETRY_MAX, not a minute and a half later."""
+    import logging
+    mod, tmp, _ = env
+    (tmp / "listen-error").write_text("starting\ndaemon: socket closed (ECONNREFUSED)\n\n")
+    adapter, _ = make_adapter(mod)
+    adapter._running = True
+    monkeypatch.setattr(mod.random, "uniform", lambda a, b: b)      # the worst jitter every time
+    real_sleep, waits = asyncio.sleep, []
+
+    async def fake_sleep(seconds, *args):
+        waits.append(seconds)
+        if len(waits) >= 10:  # a long outage
+            adapter._running = False
+        await real_sleep(0)
+
+    monkeypatch.setattr(asyncio, "sleep", fake_sleep)
+    with caplog.at_level(logging.INFO):
+        run(asyncio.wait_for(adapter._listen_loop(), 30))
+    exits = [r.getMessage() for r in caplog.records if "listen exited" in r.getMessage()]
+    assert len(exits) == 10
+    assert all(m == "[ghostly] listen exited with 1: daemon: socket closed (ECONNREFUSED)" for m in exits)
+    assert waits[0] < mod.RETRY_MAX and max(waits) == mod.RETRY_MAX <= 15
 
 
 def test_gateway_notices_never_reach_a_ghostly_chat_and_the_owner_gets_a_short_line(env):
