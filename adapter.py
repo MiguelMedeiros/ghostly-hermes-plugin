@@ -570,7 +570,7 @@ class GhostlyAdapter(BasePlatformAdapter):
             try:
                 proc = await asyncio.create_subprocess_exec(
                     binary, *pargs, "listen", "--type", "message.received", "--type", "group.message",
-                    "--type", "button.pressed", "--since", str(since),
+                    "--type", "group.mentioned", "--type", "button.pressed", "--since", str(since),
                     stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.DEVNULL, env=_cli_env(binary),
                     limit=16 * 1024 * 1024)
                 if profile:
@@ -614,7 +614,10 @@ class GhostlyAdapter(BasePlatformAdapter):
             return
         if self._dedup.is_duplicate(str(event.get("id") or "")):
             return
-        is_group = event.get("type") == "group.message"
+        # ``group.mentioned``: a mention of this profile learned after the message's ``group.message``, which had none
+        # (a copy handed on without it, or an edit that names this profile). Read as that message, mentioned.
+        late_mention = event.get("type") == "group.mentioned"
+        is_group = event.get("type") == "group.message" or late_mention
         chat_id = f"{GROUP_PREFIX}{event.get('group')}" if is_group else str(event.get("chat") or "")
         if not chat_id or chat_id == GROUP_PREFIX + "None":
             return
@@ -648,6 +651,12 @@ class GhostlyAdapter(BasePlatformAdapter):
         # A delegate speaks for the owner outside the exceptions listed in the delegate note.
         sender_is_delegate = bool(who.get("delegate")) if is_group else bool(chat.get("delegate"))
         if is_group and chat.get("mentions_only") and not (msg.get("mentioned") or sender_is_owner or sender_is_delegate):
+            # One line per message left out, so "you don't hear me in the group" can be told from a delivery problem.
+            logger.info("[ghostly] not addressed to me in %s (mentions_only): message %s from %s", chat_id[:18],
+                        str(msg.get("id") or "")[:16], member[:8] or "unknown")
+            return
+        if late_mention and not (chat.get("mentions_only") and not (sender_is_owner or sender_is_delegate)):
+            # Its group.message was read when it came (no mentions_only, or the owner's or a delegate's): no 2nd turn.
             return
         if is_group and not msg.get("mentioned") and self._answers_another_member(chat, msg):
             # The owner's tap or reply on another agent's message reaches every member: only that agent acts, no 👀 here.
