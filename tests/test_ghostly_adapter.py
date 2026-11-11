@@ -24,7 +24,8 @@ for a in "$@"; do [ "$a" = "--stdin" ] && stdin="$(cat)"; done
 printf '%s\n' "$(printf '%s\x1f' "$@")STDIN=$stdin" >> "$log"
 prof=""; if [ "$1" = "-p" ]; then prof="$2"; shift 2; fi
 case "$1 $2" in
-  "status "*) echo '{"events":{"lastSeq":41}}';;
+  "status "*) if [ -e "$dir/status-busy" ]; then echo 'Profile default is in use' >&2; exit 1; fi
+     if [ -e "$dir/status-no-events" ]; then echo '{"profile":"default"}'; else echo '{"events":{"lastSeq":41}}'; fi;;
   "chat list") cat "$dir/chats.json";;
   "group show") cat "$dir/group.json";;
   "file save") shift 2; p=""; while [ $# -gt 0 ]; do [ "$1" = "--path" ] && p="$2"; shift; done; echo data > "$p"; echo '{"saved":true}';;
@@ -426,6 +427,42 @@ def test_first_listen_starts_at_the_current_seq_and_advances_the_cursor(env):
             await task
 
     run(one_round())
+    listen = next(c for c in calls(tmp) if c[0] == "listen")
+    assert listen[listen.index("--since") + 1] == "41"
+    assert adapter._read_cursor() == 42 and captured[0].text == "new"
+
+
+@pytest.mark.parametrize("trouble", ["status-busy", "status-no-events"])
+def test_first_listen_waits_for_the_current_seq_instead_of_replaying_the_journal(env, monkeypatch, trouble):
+    """With no cursor, a ``status`` that fails ("Profile default is in use" while the daemon starts) or has no
+    ``events.lastSeq`` must not become ``--since 0``: no cursor is written and nothing listens until it answers."""
+    mod, tmp, _ = env
+    monkeypatch.setattr(mod, "RETRY_INITIAL", 0.05)
+    (tmp / trouble).write_text("")
+    (tmp / "events.jsonl").write_text(json.dumps(dm("OWNERDM", "new") | {"seq": 42}) + "\n")
+    adapter, captured = make_adapter(mod)
+    adapter._running = True
+
+    async def rounds():
+        task = asyncio.create_task(adapter._listen_loop())
+        for _ in range(100):
+            await asyncio.sleep(0.05)
+            if sum(c[0] == "status" for c in calls(tmp)) >= 2:
+                break
+        assert not adapter._cursor_path().exists()
+        assert not any("listen" in c for c in calls(tmp)) and captured == []
+        (tmp / trouble).unlink()                       # the daemon is up now
+        for _ in range(100):
+            await asyncio.sleep(0.05)
+            if captured:
+                break
+        adapter._running = False
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+    run(rounds())
+    assert sum(c[0] == "status" for c in calls(tmp)) >= 3
     listen = next(c for c in calls(tmp) if c[0] == "listen")
     assert listen[listen.index("--since") + 1] == "41"
     assert adapter._read_cursor() == 42 and captured[0].text == "new"

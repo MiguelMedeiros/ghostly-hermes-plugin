@@ -555,6 +555,25 @@ class GhostlyAdapter(BasePlatformAdapter):
         tmp.write_text(str(seq))
         tmp.replace(path)
 
+    async def _last_seq(self, profile: Optional[str] = None) -> Optional[int]:
+        """The profile's current ``events.lastSeq`` from ``ghostly status``; None (and a warning) when it cannot tell,
+        e.g. "Profile default is in use" while the daemon starts, a timeout, or an answer without ``events``."""
+        code, status, err = await _cli((["-p", profile] if profile else []) + ["status"])
+        if code == 0:
+            try:
+                seq = int((status.get("events") or {})["lastSeq"])
+                if seq >= 0:
+                    return seq
+            except (KeyError, TypeError, ValueError):
+                pass
+            reason = "no events.lastSeq in its answer"
+        else:
+            detail = err.strip().splitlines()[-1] if err.strip() else str(status.get("error") or "")
+            reason = f"exit {code}" + (f": {detail[:200]}" if detail else "")
+        logger.warning("[ghostly] status%s could not give the current event seq (%s); not listening yet, retrying",
+                       f" ({profile})" if profile else "", reason)
+        return None
+
     async def _listen_loop(self, profile: Optional[str] = None) -> None:
         """One ``ghostly listen`` stream: the default profile's, or ``profile``'s (``-p``) with its own cursor."""
         delay = RETRY_INITIAL
@@ -562,8 +581,11 @@ class GhostlyAdapter(BasePlatformAdapter):
         while self._running:
             since = self._read_cursor(profile)
             if since is None:  # first start: from now, never replay the whole history
-                code, status, _ = await _cli(pargs + ["status"])
-                since = int(((status.get("events") or {}).get("lastSeq")) or 0) if code == 0 else 0
+                since = await self._last_seq(profile)
+                if since is None:  # no guessed cursor: wait for the daemon rather than replay the journal from 0
+                    await asyncio.sleep(delay + random.uniform(0, delay / 2))
+                    delay = min(delay * 2, RETRY_MAX)
+                    continue
                 self._write_cursor(since, profile)
             binary = _ghostly_bin()
             started = time.monotonic()
