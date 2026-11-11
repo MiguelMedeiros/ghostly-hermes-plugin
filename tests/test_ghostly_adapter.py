@@ -150,6 +150,53 @@ def test_group_is_one_shared_session_with_author_prefix_and_mentions_gate(env):
     assert owner.text == "[Ana] go on" and owner.allow_gateway_control is True
 
 
+def mentioned_late(gid, member, text, message_id="g1"):
+    """``group.mentioned``: a mention of this profile learned after the message's ``group.message``, which had none."""
+    return {"seq": 52, "id": f"group.mentioned:{gid}:{message_id}", "type": "group.mentioned", "group": gid,
+            "messageId": message_id, "message": {"id": message_id, "from": "peer", "member": member, "text": text,
+                                                 "mentioned": True, "timestamp": 1790000000000}}
+
+
+def test_a_mention_learned_late_in_a_mentions_only_group_is_answered_once(env, caplog):
+    mod, tmp, _ = env
+    adapter, captured = make_adapter(mod)
+    caplog.set_level("INFO")
+    run(adapter._handle_event(grp("G1", "BOTKEY", "can you check the build?")))
+    assert captured == []
+    dropped = [r.getMessage() for r in caplog.records if "mentions_only" in r.getMessage()]
+    assert len(dropped) == 1 and "group:G1" in dropped[0] and "can you check" not in dropped[0]
+    run(adapter._handle_event(mentioned_late("G1", "BOTKEY", "can you check the build? @Hermes")))
+    assert [(e.text, e.reply_expected, e.allow_gateway_control) for e in captured] == [
+        ("[Peer] can you check the build? @Hermes", True, False)]
+    # The owner's message was read when it came: its late mention starts no second turn.
+    run(adapter._handle_event(grp("G1", "OWNERKEY", "and the tests", id="g2") | {"id": "owner-g2"}))
+    run(adapter._handle_event(mentioned_late("G1", "OWNERKEY", "and the tests @Hermes", message_id="g2")))
+    assert [e.text for e in captured] == ["[Peer] can you check the build? @Hermes", "[Ana] and the tests"]
+
+
+def test_the_listen_stream_asks_for_late_mentions(env):
+    mod, tmp, _ = env
+    (tmp / "events.jsonl").write_text(json.dumps(mentioned_late("G1", "BOTKEY", "@Hermes ping")) + "\n")
+    adapter, captured = make_adapter(mod)
+    adapter._running = True
+
+    async def scenario():
+        task = asyncio.create_task(adapter._listen_loop())
+        for _ in range(100):
+            await asyncio.sleep(0.05)
+            if captured:
+                break
+        adapter._running = False
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+    run(scenario())
+    listen = next(c for c in calls(tmp) if "listen" in c)
+    assert "group.mentioned" in [listen[i + 1] for i, a in enumerate(listen) if a == "--type"]
+    assert [e.text for e in captured] == ["[Peer] @Hermes ping"]
+
+
 def test_owner_messages_get_a_seen_reaction_right_away_and_others_do_not(env):
     """The owner gets a 👀 on each message the moment it is read: their DM, and all they write in a group."""
     mod, tmp, _ = env

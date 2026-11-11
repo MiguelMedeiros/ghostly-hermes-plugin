@@ -124,6 +124,7 @@ with `deliver=ghostly`.
 | `[ghostly] ghostly CLI not found` | Put `ghostly` on the gateway's `PATH`, or set `GHOSTLY_BIN` in `~/.hermes/.env`. |
 | No 👀 and no reply | `ghostly daemon status`; then check the chat id is in `chats.json` with `"role": "owner"`. |
 | `ignoring message from unknown chat` | The CLI could not resolve that chat on this profile. Check `ghostly chat list`. |
+| `not addressed to me in group:… (mentions_only)` | The group is `mentions_only` and the sender did not mention you: they need `group send --mention <you>` (an `@Name` typed in the text is not a mention). No such line at all = the message never reached this node. |
 | Every message answered twice | Another listener (an old bridge script) also answers. Keep only the plugin with `inbound: true`. |
 | `is not valid JSON` in the log | Fix `chats.json`; the previous allowlist stays in use until then. |
 | A reply was blocked | The CLI's secret guard saw something like a key or seed. Never send those. |
