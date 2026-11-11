@@ -57,7 +57,8 @@ FILE_SAVE_TIMEOUT_SECONDS = 180
 TYPING_REFRESH_SECONDS = 5.0
 # React at once to each owner message that is read (their DM, all they write in a group), so they see it landed.
 SEEN_EMOJI = "👀"
-RETRY_INITIAL, RETRY_MAX = 2.0, 60.0
+# While the daemon is down each failed listen is one cheap CLI spawn; a low cap reads the first message after it is back soon.
+RETRY_INITIAL, RETRY_MAX = 2.0, 15.0
 SECRET_GUARD_EXIT = 5
 _FALLBACK_BIN = os.path.expanduser("~/.local/bin/ghostly")
 GROUP_PREFIX = "group:"
@@ -289,6 +290,15 @@ async def _cli(args: List[str], stdin: Optional[str] = None, timeout: float = SE
         except ValueError:
             payload = {}
     return proc.returncode, payload if isinstance(payload, dict) else {}, err.decode("utf-8", "replace")
+
+
+async def _last_line(stream: asyncio.StreamReader, keep: int = 4096) -> str:
+    """The last non-empty line of ``stream`` (a CLI's stderr), read to EOF holding only its tail, cut to 300 chars."""
+    tail = b""
+    while chunk := await stream.read(keep):
+        tail = (tail + chunk)[-keep:]
+    lines = tail.decode("utf-8", "replace").strip().splitlines()
+    return lines[-1].strip()[:300] if lines else ""
 
 
 def _cli_error(args: List[str], code: int, payload: dict, err: str) -> Optional[str]:
@@ -567,12 +577,14 @@ class GhostlyAdapter(BasePlatformAdapter):
                 self._write_cursor(since, profile)
             binary = _ghostly_bin()
             started = time.monotonic()
+            reason = None
             try:
                 proc = await asyncio.create_subprocess_exec(
                     binary, *pargs, "listen", "--type", "message.received", "--type", "group.message",
                     "--type", "button.pressed", "--since", str(since),
-                    stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.DEVNULL, env=_cli_env(binary),
+                    stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE, env=_cli_env(binary),
                     limit=16 * 1024 * 1024)
+                reason = asyncio.create_task(_last_line(proc.stderr))  # drained as it comes: a full pipe would stall listen
                 if profile:
                     self._profile_procs[profile] = proc
                 else:
@@ -591,14 +603,19 @@ class GhostlyAdapter(BasePlatformAdapter):
                     if isinstance(event.get("seq"), int):
                         self._write_cursor(event["seq"], profile)
                 code = await proc.wait()
-                logger.warning("[ghostly] listen exited with %s", code)
+                await asyncio.wait({reason}, timeout=2)  # a child it left behind may still hold the pipe open
+                why = reason.result() if reason.done() else ""
+                logger.warning("[ghostly] listen exited with %s%s", code, f": {why}" if why else "")
             except asyncio.CancelledError:
                 raise
             except Exception:
                 logger.exception("[ghostly] listen stream failed")
+            finally:
+                if reason and not reason.done():
+                    reason.cancel()
             if time.monotonic() - started > 60:
                 delay = RETRY_INITIAL
-            await asyncio.sleep(delay + random.uniform(0, delay / 2))
+            await asyncio.sleep(min(delay + random.uniform(0, delay / 2), RETRY_MAX))
             delay = min(delay * 2, RETRY_MAX)
 
     # ---- inbound ---------------------------------------------------------------------------------
