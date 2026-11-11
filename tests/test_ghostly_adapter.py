@@ -578,6 +578,19 @@ def test_a_chat_seen_from_the_wrong_profile_is_ignored(env):
     assert captured == []
 
 
+def test_a_chat_whose_entry_names_the_default_profile_is_the_default_profiles(env):
+    """``"profile": "default"`` is the default profile, as in ``extra.profiles``: read, answered, routed to."""
+    mod, _, chats = env
+    data = json.loads(chats.read_text())
+    data["OWNERDM"]["profile"] = "default"
+    chats.write_text(json.dumps(data))
+    adapter, captured = make_adapter(mod)
+    assert adapter._listened_profiles() == [] and mod._pargs("OWNERDM") == []
+    run(adapter._handle_event(dm("OWNERDM", "hello")))
+    assert [e.text for e in captured] == ["hello"]
+    assert adapter._owner_dm() == "OWNERDM"
+
+
 def test_new_chats_of_a_second_profile_are_discovered_there_and_remember_it(env):
     mod, tmp, chats = env
     adapter, captured = make_adapter(mod)

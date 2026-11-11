@@ -69,6 +69,12 @@ DEFAULT_AGENT_NAME = "Hermes"
 _CHAT_PROFILE: Dict[str, str] = {}
 
 
+def _entry_profile(entry: Any) -> Optional[str]:
+    """The non-default Ghostly profile an allowlist entry names; None for the default one (unset or "default")."""
+    profile = str(entry.get("profile") or "") if isinstance(entry, dict) else ""
+    return profile if profile and profile != "default" else None
+
+
 def _pargs(chat: str) -> List[str]:
     """The global ``-p <profile>`` for a chat that lives in another profile; nothing for the default one."""
     profile = _CHAT_PROFILE.get(chat)
@@ -445,8 +451,7 @@ class GhostlyAdapter(BasePlatformAdapter):
         self.config.extra["allow_from"] = [cid for cid in self.chats if not cid.startswith(GROUP_PREFIX)]
         self.config.extra["group_allowed_chats"] = [cid for cid in self.chats if cid.startswith(GROUP_PREFIX)]
         _CHAT_PROFILE.clear()
-        _CHAT_PROFILE.update({cid: str(c["profile"]) for cid, c in self.chats.items()
-                              if isinstance(c, dict) and c.get("profile") and c.get("profile") != "default"})
+        _CHAT_PROFILE.update({cid: _entry_profile(c) for cid, c in self.chats.items() if _entry_profile(c)})
 
     def _listened_profiles(self) -> List[str]:
         """The extra profiles to listen to: those in ``extra.profiles`` and those an allowlisted chat lives in."""
@@ -628,10 +633,10 @@ class GhostlyAdapter(BasePlatformAdapter):
             return
         self._load_chats()
         chat = self.chats.get(chat_id)
-        if chat is not None and (chat.get("profile") or None) != profile:
+        if chat is not None and _entry_profile(chat) != profile:
             # The same id seen from another profile than the one its entry names: never answer through the wrong one.
             logger.info("[ghostly] ignoring %s: its entry is for profile %s, the event came from %s",
-                        chat_id[:12], chat.get("profile") or "default", profile or "default")
+                        chat_id[:12], _entry_profile(chat) or "default", profile or "default")
             return
         if chat is None:
             chat = await self._discover(chat_id, profile)
@@ -756,7 +761,7 @@ class GhostlyAdapter(BasePlatformAdapter):
         """The owner's DM in the default profile: the home channel's entry when it is an owner chat, else the first."""
         self._load_chats()
         owners = [cid for cid, c in self.chats.items() if isinstance(c, dict) and not cid.startswith(GROUP_PREFIX)
-                  and c.get("role") == "owner" and not c.get("profile")]
+                  and c.get("role") == "owner" and not _entry_profile(c)]
         home = _home_chat()
         for cid in owners:
             if home and home in (cid, self.chats[cid].get("label")):
