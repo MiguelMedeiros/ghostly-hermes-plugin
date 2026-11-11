@@ -174,6 +174,92 @@ def reacts(tmp):
     return [c[:-1] for c in calls(tmp) if "react" in c[:2]]
 
 
+SLOW_REACT = r"""#!/usr/bin/env bash
+# Wraps the fake CLI: a react stays alive $FAKE_REACT_SECONDS and notes how many reacts are alive with it; a message
+# id with "bad" in it fails.
+case " $* " in
+  *" react "*)
+    live="$FAKE_DIR/live"; mkdir -p "$live"; touch "$live/$$"
+    ls "$live" | wc -l | tr -d ' ' >> "$FAKE_DIR/react-peaks"
+    sleep "$FAKE_REACT_SECONDS"; rm -f "$live/$$"
+    case " $* " in *" bad"*) echo '{"error":{"code":"offline"}}'; exit 1;; esac;;
+esac
+exec "$FAKE_REAL" "$@"
+"""
+
+
+def slow_reacts(tmp, monkeypatch, seconds):
+    wrapper = tmp / "ghostly-slow-react"
+    wrapper.write_text(SLOW_REACT)
+    wrapper.chmod(wrapper.stat().st_mode | stat.S_IEXEC)
+    monkeypatch.setenv("FAKE_REAL", os.environ["GHOSTLY_BIN"])
+    monkeypatch.setenv("GHOSTLY_BIN", str(wrapper))
+    monkeypatch.setenv("FAKE_REACT_SECONDS", str(seconds))
+
+
+def owner_dm(n):
+    event = dm("OWNERDM", f"message {n}")
+    event["message"]["id"] = f"m{n}"
+    return event
+
+
+async def reacts_done(adapter):
+    while adapter._seen_tasks:
+        await asyncio.gather(*list(adapter._seen_tasks), return_exceptions=True)
+
+
+def test_a_burst_of_owner_messages_runs_a_few_reacts_at_a_time_and_skips_the_oldest(env, monkeypatch):
+    """40 owner messages at once (a catch-up after a restart): every turn starts right away, at most
+    SEEN_REACTS_AT_ONCE react processes are alive at any moment, and the newest messages still get their 👀."""
+    mod, tmp, _ = env
+    slow_reacts(tmp, monkeypatch, 0.3)
+    adapter, captured = make_adapter(mod)
+
+    async def burst():
+        for n in range(40):
+            await adapter._handle_event(owner_dm(n))
+        assert len(captured) == 40                      # no turn waited on a reaction
+        await reacts_done(adapter)
+
+    run(burst())
+    peak = max(int(n) for n in (tmp / "react-peaks").read_text().split())
+    reacted = [c[2] for c in reacts(tmp)]
+    assert peak <= mod.SEEN_REACTS_AT_ONCE
+    assert len(reacted) <= mod.SEEN_REACTS_AT_ONCE + mod.SEEN_REACTS_QUEUED
+    assert set(reacted) >= {f"m{n}" for n in range(40 - mod.SEEN_REACTS_QUEUED, 40)}
+    assert not adapter._seen_pending and not adapter._seen_tasks
+
+
+def test_a_few_owner_messages_all_get_a_seen_reaction_and_a_failed_react_breaks_nothing(env, monkeypatch):
+    """A react the CLI refuses, or one that raises, is logged; the reacts behind it and every turn still go on."""
+    mod, tmp, _ = env
+    slow_reacts(tmp, monkeypatch, 0.05)
+    monkeypatch.setattr(mod, "SEEN_REACTS_AT_ONCE", 1)     # one worker: a failure that killed it would strand the rest
+    real_cli = mod._cli
+
+    async def cli(args, *a, **kw):
+        if "boom" in args:
+            raise OSError("the CLI vanished")
+        return await real_cli(args, *a, **kw)
+
+    monkeypatch.setattr(mod, "_cli", cli)
+    adapter, captured = make_adapter(mod)
+    ids = ["boom", "bad1", "ok1", "bad2", "ok2"]
+
+    async def read_all():
+        for n, mid in enumerate(ids):
+            event = owner_dm(n)
+            event["message"]["id"] = mid
+            await adapter._handle_event(event)
+        await reacts_done(adapter)
+
+    run(read_all())
+    assert len(captured) == len(ids)
+    assert [c[2] for c in reacts(tmp)] == ["ok1", "ok2"]   # the refused ones exit before the fake logs them
+    assert len((tmp / "react-peaks").read_text().split()) == 4
+    assert not adapter._seen_pending and not adapter._seen_tasks
+
+
 def list_owner_keys(tmp, *keys, mtime=None):
     """Write owner_keys.txt where the adapter reads it by default (<HERMES_HOME>/ghostly-platform)."""
     path = tmp / ".hermes" / "ghostly-platform" / "owner_keys.txt"

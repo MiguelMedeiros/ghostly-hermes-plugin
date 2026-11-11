@@ -32,6 +32,7 @@ listened to as well (``ghostly -p <name>``), with its own cursor; the chat is re
 """
 
 import asyncio
+import collections
 import contextlib
 import json
 import logging
@@ -57,6 +58,10 @@ FILE_SAVE_TIMEOUT_SECONDS = 180
 TYPING_REFRESH_SECONDS = 5.0
 # React at once to each owner message that is read (their DM, all they write in a group), so they see it landed.
 SEEN_EMOJI = "👀"
+# Each 👀 is a `ghostly` CLI process (~70 MB): at most this many run at once, and at most SEEN_REACTS_QUEUED more wait.
+# A burst beyond that (a catch-up after a restart or a reconnect) skips the oldest waiting ones: the newest still get it.
+SEEN_REACTS_AT_ONCE = 2
+SEEN_REACTS_QUEUED = 16
 RETRY_INITIAL, RETRY_MAX = 2.0, 60.0
 SECRET_GUARD_EXIT = 5
 _FALLBACK_BIN = os.path.expanduser("~/.local/bin/ghostly")
@@ -402,7 +407,9 @@ class GhostlyAdapter(BasePlatformAdapter):
         self._profile_procs: Dict[str, asyncio.subprocess.Process] = {}
         self._dedup = MessageDeduplicator(max_size=4000, ttl_seconds=3600)
         self._typing_at: Dict[str, float] = {}
-        self._seen_tasks: set = set()
+        self._seen_tasks: set = set()       # the workers that run the 👀 reacts (at most SEEN_REACTS_AT_ONCE)
+        self._seen_pending: collections.deque = collections.deque()   # CLI args of the reacts waiting, oldest first
+        self._seen_skipped = 0
         # (chat id, question message id) -> session key of an exec approval waiting on its buttons.
         self._approvals: Dict[tuple, str] = {}
         # Approvals asked in a colleague's DM and shown in the owner's instead (oldest first):
@@ -868,21 +875,40 @@ class GhostlyAdapter(BasePlatformAdapter):
         return SendResult(success=True)
 
     def _react_seen(self, chat_id: str, message_id: str) -> None:
-        """Fire-and-forget: the turn must not wait on the reaction, and a failed one only gets logged."""
+        """Fire-and-forget: the turn must not wait on the reaction, and a failed one only gets logged.
+
+        The reacts wait in a short queue run by at most SEEN_REACTS_AT_ONCE workers, so a burst of owner messages never
+        starts a CLI process per message at once; past SEEN_REACTS_QUEUED waiting, the oldest one is skipped."""
         if chat_id.startswith(GROUP_PREFIX):
             args = _pargs(chat_id) + ["group", "react", chat_id[len(GROUP_PREFIX):], message_id, SEEN_EMOJI]
         else:
             args = _pargs(chat_id) + ["react", chat_id, message_id, SEEN_EMOJI]
+        while self._seen_pending and len(self._seen_pending) >= SEEN_REACTS_QUEUED:
+            self._seen_pending.popleft()
+            self._seen_skipped += 1
+        self._seen_pending.append(args)
+        if len(self._seen_tasks) < SEEN_REACTS_AT_ONCE:
+            task = asyncio.create_task(self._react_worker())
+            self._seen_tasks.add(task)
+            task.add_done_callback(self._seen_tasks.discard)
 
-        async def react() -> None:
-            code, payload, err = await _cli(args, timeout=30)
-            error = _cli_error(args, code, payload, err)
-            if error:
-                logger.warning("[ghostly] seen reaction: %s", error)
-
-        task = asyncio.create_task(react())
-        self._seen_tasks.add(task)
-        task.add_done_callback(self._seen_tasks.discard)
+    async def _react_worker(self) -> None:
+        try:
+            while self._seen_pending:
+                args = self._seen_pending.popleft()
+                try:
+                    code, payload, err = await _cli(args, timeout=30)
+                    error = _cli_error(args, code, payload, err)
+                except Exception as exc:  # best effort: one bad react must not strand the ones queued behind it
+                    error = repr(exc)
+                if error:
+                    logger.warning("[ghostly] seen reaction: %s", error)
+            if self._seen_skipped:
+                logger.info("[ghostly] skipped the seen reaction on %d older messages of a burst", self._seen_skipped)
+                self._seen_skipped = 0
+        finally:
+            # Out of the count before the next react is queued (the done callback runs a loop step later).
+            self._seen_tasks.discard(asyncio.current_task())
 
     async def _save_file(self, f: dict, chat_id: str = "") -> Optional[str]:
         self.media_dir.mkdir(parents=True, exist_ok=True)
