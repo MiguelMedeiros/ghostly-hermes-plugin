@@ -455,6 +455,70 @@ def test_gateway_notices_never_reach_a_ghostly_chat_and_the_owner_gets_a_short_l
     assert "a normal reply" in "".join(calls(tmp)[-1])
 
 
+def _walk_every_catalog(mod, content):
+    """The notice check as it was before the map was cached: every catalog walked on every call."""
+    from agent.i18n import _load_catalog, supported_languages
+    from agent.turn_failure_copy import FAILED_TURN_NOTICE, PARTIAL_FAILED_TURN_NOTICE
+    prefixes = {}
+    for lang in supported_languages():
+        for key, text in _load_catalog(lang).items():
+            if key.startswith("gateway.errors.") and isinstance(text, str):
+                prefix = text.split("{", 1)[0].strip()
+                if len(prefix) >= 20:
+                    prefixes[prefix] = "silence" if key == "gateway.errors.unexpected_silence" else "error"
+    for text in (FAILED_TURN_NOTICE, PARTIAL_FAILED_TURN_NOTICE):
+        prefixes[str(text).strip()[:80]] = "error"
+    text = (content or "").strip()
+    if text.startswith("♻️ Recovered reply") and "\n\n" in text:
+        text = text.split("\n\n", 1)[1].strip()
+    if text.startswith(mod._LIFECYCLE_PREFIXES):
+        return "status"
+    return next((kind for prefix, kind in prefixes.items() if text.startswith(prefix)), None)
+
+
+def test_the_notice_check_builds_its_map_once_and_answers_as_the_full_walk_did(env, monkeypatch):
+    """Every outbound send and edit asks whether the text is a gateway notice. The {prefix: kind} map is built once per
+    set of catalogs (not walked again per call, ~5 ms with 17 languages), gives the same answers as the walk, and is
+    built again when Hermes hands out new catalogs (reset_language_cache, a pack or overlay)."""
+    mod, _, _ = env
+    from agent import i18n
+    from agent.i18n import t
+    from agent.turn_failure_copy import FAILED_TURN_NOTICE, PARTIAL_FAILED_TURN_NOTICE
+    samples = ["", "hello", "Sure, here is the plan for tomorrow.", "⏳ Still waiting for the other Hermes process",
+               FAILED_TURN_NOTICE, PARTIAL_FAILED_TURN_NOTICE, "♻️ Recovered reply — x:\n\n" + FAILED_TURN_NOTICE]
+    for lang in i18n.supported_languages():
+        silence = t("gateway.errors.unexpected_silence", lang=lang)
+        catalog = i18n._load_catalog(lang)
+        errors = [v for k, v in sorted(catalog.items()) if k.startswith("gateway.errors.") and isinstance(v, str)]
+        samples += [silence, silence[:12], *errors[:5]]
+    builds = []
+    real_build = mod._build_notice_prefixes
+    monkeypatch.setattr(mod, "_build_notice_prefixes", lambda c: builds.append(1) or real_build(c))
+    assert [mod._gateway_notice_kind(s) for s in samples] == [_walk_every_catalog(mod, s) for s in samples]
+    assert {mod._gateway_notice_kind(s) for s in samples} == {None, "status", "error", "silence"}
+    assert len(builds) == 1
+
+    import time
+    start = time.perf_counter()
+    for _ in range(200):
+        mod._outbound_for_notice({"role": "owner"}, "Sure, here is the plan for tomorrow.")
+    assert (time.perf_counter() - start) / 200 < 0.002  # the full walk took ~5 ms per check
+    assert len(builds) == 1
+
+    # New catalogs (what reset_language_cache leads to) rebuild the map, and a new notice text is recognised.
+    i18n.reset_language_cache()
+    real_load = i18n._load_catalog
+    extra = "The tool runner went away before answering"
+
+    def load(lang, home=None):
+        catalog = real_load(lang, home)
+        return {**catalog, "gateway.errors.test_only": extra + " ({detail})"} if lang == "en" else catalog
+
+    monkeypatch.setattr(i18n, "_load_catalog", load)
+    assert mod._gateway_notice_kind(extra + " (boom)") == "error" == _walk_every_catalog(mod, extra + " (boom)")
+    assert len(builds) >= 2
+
+
 def test_unaddressed_group_messages_and_peer_dms_may_stay_silent(env):
     """reply_expected tells the gateway whether a bare NO_REPLY is a valid answer: only a group message that mentions
     me (or replies to my message) and the owner's DM require a reply."""

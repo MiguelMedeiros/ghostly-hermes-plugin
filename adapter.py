@@ -41,7 +41,7 @@ import shutil
 import time
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 from gateway.config import Platform, PlatformConfig
 from gateway.platforms._shared import get_scoped_secret as _get_scoped_secret, send_error
@@ -131,21 +131,50 @@ OWNER_ERROR_REPLY = "⚠️ Something failed on my side; the details are in the 
 _SILENCE_KEY = "gateway.errors.unexpected_silence"
 
 
-def _gateway_notice_prefixes() -> Dict[str, str]:
-    """{text prefix: kind} for the gateway's own notices, in every catalog language: the silence-marker warning
-    ("silence") and the other ``gateway.errors.*`` / failed-turn texts ("error"). Read from the catalogs at call time
-    (a module constant would go stale on the next Hermes update, as ``_UNEXPECTED_SILENCE_REPLY`` did)."""
-    out: Dict[str, str] = {}
+def _notice_catalogs() -> Tuple[Dict[str, str], ...]:
+    """The catalogs of every language, as ``agent.i18n`` hands them out now."""
     try:
         from agent.i18n import _load_catalog, supported_languages
         langs = supported_languages()
     except Exception:
-        return out
+        return ()
+    out = []
     for lang in langs:
         try:
-            catalog = _load_catalog(lang)
+            out.append(_load_catalog(lang))
         except Exception:
             continue
+    return tuple(out)
+
+
+# (catalogs, {prefix: kind}, the prefixes as a tuple for str.startswith). agent.i18n caches each catalog per
+# (home, lang) until reset_language_cache, so the same objects mean the same texts and the map is rebuilt only when it
+# hands out others (a pack, overlay or language change, another profile home). Holding them keeps their ids unique.
+_notice_cache: Tuple[Tuple[Dict[str, str], ...], Dict[str, str], Tuple[str, ...]] = ((), {}, ())
+
+
+def _notice_lookup() -> Tuple[Dict[str, str], Tuple[str, ...]]:
+    global _notice_cache
+    catalogs = _notice_catalogs()
+    cached, prefixes, starts = _notice_cache
+    if not (catalogs and len(cached) == len(catalogs) and all(a is b for a, b in zip(cached, catalogs))):
+        prefixes = _build_notice_prefixes(catalogs)
+        starts = tuple(prefixes)
+        _notice_cache = (catalogs, prefixes, starts)
+    return prefixes, starts
+
+
+def _gateway_notice_prefixes() -> Dict[str, str]:
+    """{text prefix: kind} for the gateway's own notices, in every catalog language: the silence-marker warning
+    ("silence") and the other ``gateway.errors.*`` / failed-turn texts ("error"). Read from the catalogs Hermes has
+    loaded (a module constant would go stale on the next Hermes update, as ``_UNEXPECTED_SILENCE_REPLY`` did), and
+    built again only when those change. The dict is shared: do not modify it."""
+    return _notice_lookup()[0]
+
+
+def _build_notice_prefixes(catalogs: Tuple[Dict[str, str], ...]) -> Dict[str, str]:
+    out: Dict[str, str] = {}
+    for catalog in catalogs:
         for key, text in catalog.items():
             if not key.startswith("gateway.errors.") or not isinstance(text, str):
                 continue
@@ -182,7 +211,10 @@ def _gateway_notice_kind(content: str) -> Optional[str]:
         text = text.split("\n\n", 1)[1].strip()
     if text.startswith(_LIFECYCLE_PREFIXES):
         return "status"
-    for prefix, kind in _gateway_notice_prefixes().items():
+    prefixes, starts = _notice_lookup()
+    if not text.startswith(starts):
+        return None
+    for prefix, kind in prefixes.items():
         if text.startswith(prefix):
             return kind
     return None
