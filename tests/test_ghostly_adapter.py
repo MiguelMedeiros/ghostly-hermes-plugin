@@ -150,6 +150,57 @@ def test_group_is_one_shared_session_with_author_prefix_and_mentions_gate(env):
     assert owner.text == "[Ana] go on" and owner.allow_gateway_control is True
 
 
+def late_mention(gid, member, text, **extra):
+    """``group.mentioned`` (CLI 1.11): a mention of this profile learned after the message's ``group.message``."""
+    event = grp(gid, member, text, mentioned=True, **extra)
+    return {**event, "seq": 52, "id": f"group.mentioned:{gid}:g1", "type": "group.mentioned", "messageId": "g1"}
+
+
+def test_a_mention_learned_after_the_message_starts_the_turn_the_mentions_gate_dropped(env):
+    """The copy that reached us first named no one (dropped in a mentions_only group); the author's copy, or an edit,
+    names me later and arrives as ``group.mentioned``: that is the turn, once."""
+    mod, tmp, _ = env
+    (tmp / "events.jsonl").write_text(
+        json.dumps(grp("G1", "BOTKEY", "@Hermes rebase?")) + "\n"
+        + json.dumps(late_mention("G1", "BOTKEY", "@Hermes rebase?")) + "\n")
+    adapter, captured = make_adapter(mod)
+    _one_listen_round(adapter, captured)
+    listen = next(c for c in calls(tmp) if c[0] == "listen")
+    assert "group.mentioned" in [listen[i + 1] for i, a in enumerate(listen) if a == "--type"]
+    assert [e.text for e in captured] == ["[Peer] @Hermes rebase?"]
+    turn = captured[0]
+    assert turn.source.chat_id == "group:G1" and turn.reply_expected is True and turn.allow_gateway_control is False
+    assert adapter._read_cursor() == 52
+
+
+def test_a_late_mention_never_doubles_a_turn_the_message_already_started(env):
+    """The owner and a delegate are read without a mention, and a group without mentions_only reads everyone: their
+    ``group.message`` was the turn already."""
+    mod, tmp, chats = env
+    data = json.loads(chats.read_text())
+    data["group:G1"]["members"]["DELEGATEKEY"] = {"name": "Deputy", "delegate": True}
+    data["group:G3"] = {"label": "all", "name": "the open group", "role": "group", "members": {}}
+    chats.write_text(json.dumps(data))
+    adapter, captured = make_adapter(mod)
+    read_group(adapter, grp("G1", "OWNERKEY", "and you?"), late_mention("G1", "OWNERKEY", "and you, @Hermes?"),
+               grp("G1", "DELEGATEKEY", "go on"), late_mention("G1", "DELEGATEKEY", "go on @Hermes"),
+               grp("G3", "BOTKEY", "anyone?"), late_mention("G3", "BOTKEY", "anyone? @Hermes"))
+    assert [e.text for e in captured] == ["[Ana] and you?", "[Deputy] go on", "[BOTKEY] anyone?"]
+    assert len(reacts(tmp)) == 1                    # the owner's message, once
+
+
+def test_a_message_the_mentions_gate_drops_is_logged_without_its_text(env, caplog):
+    import logging
+    mod, _, _ = env
+    adapter, captured = make_adapter(mod)
+    with caplog.at_level(logging.INFO, logger=mod.logger.name):
+        run(adapter._handle_event(grp("G1", "BOTKEY", "talking among themselves")))
+    assert captured == []
+    dropped = [r.getMessage() for r in caplog.records if "mention" in r.getMessage()]
+    assert len(dropped) == 1 and "group:G1" in dropped[0] and "g1" in dropped[0] and "BOTKEY"[:8] in dropped[0]
+    assert "talking among themselves" not in caplog.text
+
+
 def test_owner_messages_get_a_seen_reaction_right_away_and_others_do_not(env):
     """The owner gets a 👀 on each message the moment it is read: their DM, and all they write in a group."""
     mod, tmp, _ = env
