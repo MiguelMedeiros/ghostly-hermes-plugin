@@ -6,6 +6,7 @@ Run with ``tests/run`` from the repo root: it finds the Hermes Agent's Python an
 import asyncio
 import importlib.util
 import json
+import logging
 import os
 import stat
 import sys
@@ -576,6 +577,26 @@ def test_a_chat_seen_from_the_wrong_profile_is_ignored(env):
     run(adapter._handle_event(dm("BHCHAT", "on the default stream")))                 # its entry says testing
     run(adapter._handle_event(dm("OWNERDM", "on the test stream"), "testing"))  # the owner's chat is the default's
     assert captured == []
+
+
+def test_an_events_gap_is_one_warning_with_the_range_and_the_cursor_moves_past_it(env, caplog):
+    """The daemon's journal lost 11-60 (a crash, a trim): ``listen --since 10`` says so with an ``events.gap`` whose seq
+    is the cursor itself. One warning names the range and the count (no message text), the next event is a turn."""
+    mod, tmp, _ = env
+    gap = {"seq": 10, "id": "events.gap:10:61", "type": "events.gap", "at": 1790000000000, "from": 11, "to": 60}
+    owner = dm("OWNERDM", "still there?") | {"seq": 61}
+    (tmp / "events.jsonl").write_text(json.dumps(gap) + "\n" + json.dumps(owner) + "\n")
+    adapter, captured = make_adapter(mod)
+    adapter._write_cursor(10)
+    with caplog.at_level(logging.INFO):
+        _one_listen_round(adapter, captured)
+    listen = next(c for c in calls(tmp) if c[0] == "listen")
+    assert listen[listen.index("--since") + 1] == "10"
+    gaps = [r for r in caplog.records if "events.gap" in r.getMessage()]
+    assert len(gaps) == 1 and gaps[0].levelno == logging.WARNING
+    assert "events 11-60 (50) were lost" in gaps[0].getMessage()
+    assert not any("still there?" in r.getMessage() for r in caplog.records)
+    assert [e.text for e in captured] == ["still there?"] and adapter._read_cursor() == 61
 
 
 def test_new_chats_of_a_second_profile_are_discovered_there_and_remember_it(env):

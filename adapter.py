@@ -370,6 +370,19 @@ async def _standalone_send(
     return await _deliver(chat_id, message, media_files)
 
 
+def _log_gap(event: Dict[str, Any], profile: Optional[str] = None) -> None:
+    """``events.gap``: the daemon's journal no longer holds ``from``..``to`` (a crash, a trim), so ``--since`` could
+    not replay them. One warning with the range and the count, never message text; the cursor moves past it."""
+    first, last = event.get("from"), event.get("to")
+    where = f" ({profile})" if profile else ""
+    if isinstance(first, int) and isinstance(last, int) and last >= first:
+        logger.warning("[ghostly] events %d-%d (%d) were lost by the daemon%s (events.gap): messages in that range "
+                       "never reached the gateway", first, last, last - first + 1, where)
+    else:
+        logger.warning("[ghostly] events were lost by the daemon%s (events.gap, range unknown): messages in it "
+                       "never reached the gateway", where)
+
+
 class GhostlyAdapter(BasePlatformAdapter):
     """Ghostly chats as gateway sessions; outbound always, inbound when ``extra.inbound`` is on."""
 
@@ -604,6 +617,9 @@ class GhostlyAdapter(BasePlatformAdapter):
     # ---- inbound ---------------------------------------------------------------------------------
 
     async def _handle_event(self, event: dict, profile: Optional[str] = None) -> None:
+        if event.get("type") == "events.gap":
+            _log_gap(event, profile)
+            return
         if event.get("type") == "button.pressed":
             chat_id = f"{GROUP_PREFIX}{event['group']}" if event.get("group") else str(event.get("chat") or "")
             await self._resolve_press(chat_id, str(event.get("messageId") or ""), str(event.get("button") or ""),
