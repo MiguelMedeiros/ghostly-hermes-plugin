@@ -217,10 +217,18 @@ def _reply_expected(is_group: bool, role: str, msg: Dict[str, Any]) -> Optional[
     return False if role in PEER_ROLES else None
 
 
+def _configured_bin() -> str:
+    return (_get_scoped_secret("GHOSTLY_BIN", "") or "").strip()
+
+
 def _ghostly_bin() -> Optional[str]:
-    configured = (_get_scoped_secret("GHOSTLY_BIN", "") or "").strip()
+    configured = _configured_bin()
     if configured:
-        return configured if os.access(configured, os.X_OK) else None
+        # .env values reach us unexpanded (python-dotenv leaves ``~``); a bare name is looked up on PATH.
+        path = os.path.expanduser(configured)
+        if os.sep not in path:
+            return shutil.which(path)
+        return path if os.access(path, os.X_OK) else None
     return shutil.which("ghostly") or (_FALLBACK_BIN if os.access(_FALLBACK_BIN, os.X_OK) else None)
 
 
@@ -515,7 +523,8 @@ class GhostlyAdapter(BasePlatformAdapter):
 
     async def connect(self, *, is_reconnect: bool = False) -> bool:
         if not check_requirements():
-            logger.warning("[ghostly] ghostly CLI not found; delivery disabled")
+            tried = f"GHOSTLY_BIN={_configured_bin()}" if _configured_bin() else "ghostly on PATH or ~/.local/bin/ghostly"
+            logger.warning("[ghostly] ghostly CLI not found (tried %s); delivery disabled", tried)
             return False
         self._load_chats()
         self._mark_connected()
