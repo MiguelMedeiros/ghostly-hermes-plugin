@@ -336,6 +336,25 @@ def test_allowlist_edits_are_picked_up_without_restart(env):
     assert captured[0].allow_gateway_control is True
 
 
+def test_an_allowlist_being_edited_is_never_written_over(env):
+    mod, _, chats = env
+    adapter, captured = make_adapter(mod)
+    for n, broken in enumerate([
+            chats.read_text()[:-1] + ', "FRIENDDM": {"label": "friend", "role": "contact"},}',  # trailing comma
+            json.dumps([{"OWNERDM": {"role": "owner"}}])]):                                        # not an object
+        chats.write_text(broken)
+        os.utime(chats, (1, 2_000_000_000 + n))
+        run(adapter._handle_event(dm("newdm", f"hello {n}")))
+        assert chats.read_text() == broken
+    # The previous allowlist stays in use, the new chat too; once the file reads again its next message saves it.
+    assert [e.text for e in captured] == ["hello 0", "hello 1"]
+    assert {"OWNERDM", "newdm"} <= set(adapter.config.extra["allow_from"])
+    chats.write_text(json.dumps({"OWNERDM": {"label": "owner", "name": "Ana", "role": "owner"}}))
+    os.utime(chats, (1, 2_000_000_100))
+    run(adapter._handle_event(dm("newdm", "hello again")))
+    assert set(json.loads(chats.read_text())) == {"OWNERDM", "newdm"}
+
+
 def test_received_file_is_saved_and_typed(env):
     mod, tmp, _ = env
     adapter, captured = make_adapter(mod)
