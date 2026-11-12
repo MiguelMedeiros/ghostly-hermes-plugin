@@ -753,3 +753,27 @@ def test_names_in_the_prompts_come_from_the_config_with_neutral_defaults(env):
     assert plain.owner_keys_file == plain.state_dir / "owner_keys.txt"
     named = mod.GhostlyAdapter(PlatformConfig(enabled=True, extra={"owner_name": "Ana", "agent_name": "Hermes (lab)"}))
     assert "NOT Ana" in named.role_notes["contact"] and "You are Hermes (lab)." in named.role_notes["agent_peer"]
+
+
+def test_ghostly_bin_with_a_tilde_or_a_bare_name_is_found(env, tmp_path, monkeypatch):
+    mod, _, _ = env
+    # python-dotenv leaves ``~`` as is, so ~/.hermes/.env hands the plugin the literal value.
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.setenv("GHOSTLY_BIN", "~/ghostly")
+    assert mod._ghostly_bin() == str(tmp_path / "ghostly")
+    assert mod.check_requirements()
+    # A wrapper's bare name is looked up on PATH.
+    monkeypatch.setenv("PATH", os.pathsep.join([str(tmp_path), os.environ.get("PATH", "")]))
+    monkeypatch.setenv("GHOSTLY_BIN", "ghostly")
+    assert mod._ghostly_bin() == str(tmp_path / "ghostly")
+    monkeypatch.setenv("GHOSTLY_BIN", "~/missing-ghostly")
+    assert mod._ghostly_bin() is None
+
+
+def test_missing_ghostly_bin_names_the_value_tried(env, monkeypatch, caplog):
+    mod, _, _ = env
+    monkeypatch.setenv("GHOSTLY_BIN", "~/missing-ghostly")
+    adapter, _ = make_adapter(mod)
+    with caplog.at_level("WARNING"):
+        assert run(adapter.connect()) is False
+    assert "GHOSTLY_BIN=~/missing-ghostly" in caplog.text
