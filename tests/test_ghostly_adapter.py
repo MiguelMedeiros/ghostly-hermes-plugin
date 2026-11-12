@@ -753,3 +753,27 @@ def test_names_in_the_prompts_come_from_the_config_with_neutral_defaults(env):
     assert plain.owner_keys_file == plain.state_dir / "owner_keys.txt"
     named = mod.GhostlyAdapter(PlatformConfig(enabled=True, extra={"owner_name": "Ana", "agent_name": "Hermes (lab)"}))
     assert "NOT Ana" in named.role_notes["contact"] and "You are Hermes (lab)." in named.role_notes["agent_peer"]
+
+
+def test_malformed_allowlist_entries_are_dropped_and_the_rest_keeps_working(env, caplog):
+    mod, tmp, chats = env
+    chats.write_text(json.dumps({
+        "OWNERDM": {"label": "owner", "name": "Ana", "role": "owner"},
+        "BADDM": "owner",                                                          # a bare role, not an object
+        "group:G1": {"label": "dev", "role": "group", "mentions_only": True,
+                     "members": {"OWNERKEY": {"name": "Ana", "owner": True}, "BOTKEY": "Peer"}},  # a bare name
+        "group:G3": {"label": "ops", "role": "group", "members": ["OWNERKEY"]},    # a list, not an object
+    }))
+    with caplog.at_level("ERROR"):
+        adapter, captured = make_adapter(mod)
+    read_group(adapter, grp("G1", "OWNERKEY", "owner talking"), grp("G1", "BOTKEY", "@Hermes hi", mentioned=True),
+               grp("G3", "OWNERKEY", "@Hermes ops", mentioned=True), grp("G2", "OWNERKEY", "new group"))
+    run(adapter._handle_event(dm("BADDM", "hi")))                               # unresolvable now: ignored, no error
+    run(adapter._handle_event(dm("OWNERDM", "hi")))
+    assert [e.text.split("] ", 1)[-1] for e in captured] == ["owner talking", "@Hermes hi", "@Hermes ops", "new group", "hi"]
+    assert json.loads(chats.read_text())["group:G2"]["members"]["OWNERKEY"].get("owner") is True
+    assert "BADDM" not in adapter.config.extra["allow_from"]
+    # One error line per dropped entry, naming it.
+    errors = [r.getMessage() for r in caplog.records if r.name == mod.logger.name and r.levelname == "ERROR"]
+    assert len(errors) == 3
+    assert any("BADDM" in e for e in errors) and any("BOTKEY" in e for e in errors) and any("group:G3" in e for e in errors)
