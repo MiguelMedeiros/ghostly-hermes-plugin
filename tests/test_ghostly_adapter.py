@@ -455,6 +455,28 @@ def test_gateway_notices_never_reach_a_ghostly_chat_and_the_owner_gets_a_short_l
     assert "a normal reply" in "".join(calls(tmp)[-1])
 
 
+def test_tool_progress_stays_out_of_groups_and_reaches_dms(env):
+    """The tool feed ("✍️ Writing …", "💻 Running …", a command block) is dropped in a group, sends and edits alike;
+    DMs keep it, and a group's short status lines (▶️ / ✅ / ⚠️ / 🔴) still go out."""
+    mod, tmp, _ = env
+    adapter, _ = make_adapter(mod)
+    feed = "📚 Reading skill \"ghostly-chat\"\n✍️ Writing ~/code/x.md\n💻 Running\n```\ngit status\n```"
+    assert run(adapter.send("group:G1", feed)).success
+    assert run(adapter.send("group:G1", "✍️ Writing NOTES.md")).success
+    assert run(adapter.edit_message("group:G1", "m9", feed + "\n🔍 Searching files")).success
+    assert calls(tmp) == []
+    for status in ("▶️ started on the release notes", "✅ PR merged", "⚠️ CI is red", "PR opened",
+                   "🔴 blocked: the Desktop CI"):
+        assert run(adapter.send("group:G1", status)).success
+    sent = ["".join(c) for c in calls(tmp)]
+    assert len(sent) == 5 and "blocked" in sent[-1]
+    log = tmp / "calls.log"
+    assert run(adapter.send("OWNERDM", feed)).success
+    assert log.read_text().count("Reading skill") == 1
+    assert run(adapter.send("PEERDM", feed)).success
+    assert log.read_text().count("Reading skill") == 2
+
+
 def test_unaddressed_group_messages_and_peer_dms_may_stay_silent(env):
     """reply_expected tells the gateway whether a bare NO_REPLY is a valid answer: only a group message that mentions
     me (or replies to my message) and the owner's DM require a reply."""

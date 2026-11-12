@@ -188,10 +188,54 @@ def _gateway_notice_kind(content: str) -> Optional[str]:
     return None
 
 
+# The emoji a tool-progress line starts with ("✍️ Writing …", "💻 Running …", "📚 Reading skill …"): the tools' own
+# emoji (tools.registry) plus the gateway's defaults for tools without one.
+_TOOL_PROGRESS_EMOJI_FALLBACK = frozenset(
+    "⚙️ ⚡ ✍️ 💻 📚 📖 📝 📄 📋 🔍 🔎 🌐 🧠 🧩 🧪 🧭 🔧 🔗 🔖 🔐 🔊 🔀 💬 💡 🖥️ 🖱️ 🖼️ 🪟 🎬 🎨 🎛 👁️ 🐍 🐦 ⏰ ❓".split())
+
+
+def _tool_progress_emoji() -> frozenset:
+    found: set[str] = set(_TOOL_PROGRESS_EMOJI_FALLBACK)
+    with contextlib.suppress(Exception):
+        from tools.registry import registry
+        names = registry.get_all_tool_names() if hasattr(registry, "get_all_tool_names") else list(getattr(registry, "_tools", {}))
+        for name in names:
+            emoji = registry.get_emoji(name, default="")
+            if emoji:
+                found.add(emoji)
+    return frozenset(found)
+
+
+def _is_tool_progress(content: str) -> bool:
+    """The gateway's tool-progress bubble (display.tool_progress): every line is "<tool emoji> <tool or verb>…", or a
+    fenced command block under such a line. Config can only turn it off per platform, so groups drop it here."""
+    lines = [line.strip() for line in (content or "").splitlines() if line.strip()]
+    if not lines:
+        return False
+    emoji = _tool_progress_emoji()
+    in_fence = False
+    saw_tool_line = False
+    for line in lines:
+        if line.startswith("```"):
+            if not saw_tool_line:
+                return False
+            in_fence = not in_fence
+            continue
+        if in_fence:
+            continue
+        head, _, rest = line.partition(" ")
+        if head not in emoji or not rest.strip():
+            return False
+        saw_tool_line = True
+    return saw_tool_line and not in_fence
+
+
 def _outbound_for_notice(chat: Dict[str, Any], content: str) -> Optional[str]:
     """Never post a gateway notice (silence warning, internal/tool error) into a Ghostly chat: groups, peers and
     contacts get nothing; the owner's DM gets a short line instead. Returns the text to send ("" = drop), or None when
     ``content`` is a normal reply."""
+    if chat.get("role") == "group" and _is_tool_progress(content):
+        return ""  # a group gets the short status lines only, never the tool feed
     kind = _gateway_notice_kind(content)
     if kind is None:
         return None
