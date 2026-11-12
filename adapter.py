@@ -413,6 +413,27 @@ class GhostlyAdapter(BasePlatformAdapter):
 
     # ---- allowlist -------------------------------------------------------------------------------
 
+    def _valid_chats(self, data):
+        """Drop the entries of a chats.json object that are not objects (a chat written as ``"<id>": "owner"``, a member
+        as ``"<key>": "Ana"``, ``members`` as a list), with one error line each, so the rest of the file still works."""
+        if not isinstance(data, dict):
+            return data
+        chats = {}
+        for cid, chat in data.items():
+            if not isinstance(chat, dict):
+                logger.error("[ghostly] %s: chat %s is not an object; ignoring it", self.chats_file, cid)
+                continue
+            members = chat.get("members")
+            if members is not None and not isinstance(members, dict):
+                logger.error("[ghostly] %s: members of %s is not an object; ignoring them", self.chats_file, cid)
+                chat = {k: v for k, v in chat.items() if k != "members"}
+            elif members:
+                for key in [k for k, m in members.items() if not isinstance(m, dict)]:
+                    logger.error("[ghostly] %s: member %s of %s is not an object; ignoring it", self.chats_file, key, cid)
+                chat = {**chat, "members": {k: m for k, m in members.items() if isinstance(m, dict)}}
+            chats[cid] = chat
+        return chats
+
     def _load_chats(self) -> None:
         try:
             mtime = self.chats_file.stat().st_mtime
@@ -423,7 +444,7 @@ class GhostlyAdapter(BasePlatformAdapter):
         if mtime == self._chats_mtime:
             return
         try:
-            data = json.loads(self.chats_file.read_text())
+            data = self._valid_chats(json.loads(self.chats_file.read_text()))
         except ValueError as exc:
             logger.error("[ghostly] %s is not valid JSON (%s); keeping the previous allowlist", self.chats_file, exc)
             return
