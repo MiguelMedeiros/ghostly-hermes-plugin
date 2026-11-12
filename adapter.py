@@ -427,17 +427,29 @@ class GhostlyAdapter(BasePlatformAdapter):
         except ValueError as exc:
             logger.error("[ghostly] %s is not valid JSON (%s); keeping the previous allowlist", self.chats_file, exc)
             return
-        self.chats, self._chats_mtime = (data if isinstance(data, dict) else {}), mtime
+        if not isinstance(data, dict):
+            logger.error("[ghostly] %s is not a JSON object of chats; keeping the previous allowlist", self.chats_file)
+            return
+        self.chats, self._chats_mtime = data, mtime
         self._publish_allowlist()
 
     def _save_chats(self) -> None:
+        self._publish_allowlist()
+        try:
+            on_disk = self.chats_file.stat().st_mtime
+        except FileNotFoundError:
+            on_disk = 0.0
+        if on_disk != self._chats_mtime:
+            # The file changed since it was last read (an edit in progress, not valid yet): never write over it. A chat
+            # added meanwhile is allowed from memory, and its first message once the file reads again writes it there.
+            logger.warning("[ghostly] %s changed since it was last read; not writing over it", self.chats_file)
+            return
         self.state_dir.mkdir(parents=True, exist_ok=True)
         tmp = self.chats_file.with_suffix(".tmp")
         tmp.write_text(json.dumps(self.chats, ensure_ascii=False, indent=2))
         os.chmod(tmp, 0o600)
         tmp.replace(self.chats_file)
         self._chats_mtime = self.chats_file.stat().st_mtime
-        self._publish_allowlist()
 
     def _publish_allowlist(self) -> None:
         """Gateway authorization reads ``extra.allow_from`` (DM user ids) and ``extra.group_allowed_chats``
