@@ -9,6 +9,7 @@ import json
 import os
 import stat
 import sys
+import time
 from pathlib import Path
 
 import pytest
@@ -453,6 +454,50 @@ def test_gateway_notices_never_reach_a_ghostly_chat_and_the_owner_gets_a_short_l
     assert mod.OWNER_ERROR_REPLY in "".join(sent[1]) and FAILED_TURN_NOTICE not in "".join(sent[1])
     assert run(adapter.send("group:G1", "a normal reply")).success      # normal replies are untouched
     assert "a normal reply" in "".join(calls(tmp)[-1])
+
+
+def test_the_first_send_never_loads_the_catalogs_on_the_loop(env, monkeypatch):
+    """Parsing the 17 locale catalogs takes seconds with the pure-Python YAML parser: the first send must not do it on
+    the gateway's loop. connect() loads them in the background; then a notice in any catalog language is caught."""
+    mod, tmp, _ = env
+    from agent import i18n_layers
+    from agent.i18n import _catalog_cache, _current_home, supported_languages, t
+    parse = i18n_layers.parse_locale_file
+
+    def slow_parse(path):
+        time.sleep(0.05)  # 17 files: ~0.85 s, a fraction of what the pure-Python parser takes on a loaded host
+        return parse(path)
+
+    monkeypatch.setattr(i18n_layers, "parse_locale_file", slow_parse)
+    adapter, _ = make_adapter(mod, inbound=False)
+
+    async def first_send():
+        gaps, done = [], asyncio.Event()
+
+        async def heartbeat():
+            last = time.perf_counter()
+            while not done.is_set():
+                await asyncio.sleep(0.005)
+                now = time.perf_counter()
+                gaps.append(now - last)
+                last = now
+
+        beat = asyncio.create_task(heartbeat())
+        await asyncio.sleep(0.02)
+        result = await adapter.send("OWNERDM", "a normal reply")
+        done.set()
+        await beat
+        return result, max(gaps)
+
+    result, stall = run(first_send())
+    assert result.success
+    assert stall < 0.3, f"the first send blocked the loop for {stall:.3f} s"
+    assert run(adapter.connect()) is True
+    home = _current_home()
+    mod._notice_warmups[home].join(timeout=60)
+    assert all((home, lang) in _catalog_cache for lang in supported_languages(home))
+    assert run(adapter.send("group:G1", t("gateway.errors.unexpected_silence", lang="de"))).success
+    assert not [c for c in calls(tmp) if "G1" in c]
 
 
 def test_unaddressed_group_messages_and_peer_dms_may_stay_silent(env):
