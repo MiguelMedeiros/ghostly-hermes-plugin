@@ -791,8 +791,15 @@ class GhostlyAdapter(BasePlatformAdapter):
             self._listen_task = asyncio.create_task(self._listen_loop())
             self._profile_tasks = [asyncio.create_task(self._listen_loop(p)) for p in self._listened_profiles()]
             self._wire_plugin_handlers(None)
+        home = _home_chat()
         logger.info("[ghostly] Ready (inbound %s, %d chats, home chat %s)",
-                    "on" if self.inbound else "off", len(self.chats), _home_chat() or "<unset>")
+                    "on" if self.inbound else "off", len(self.chats), home or "<unset>")
+        # Hermes mirrors a cron delivery into the session whose origin chat_id is the target as given, so a label
+        # delivers but never reaches the chat's session. A reconnect's fresh adapter doesn't say it again.
+        labelled = [cid for cid, c in self.chats.items() if isinstance(c, dict) and c.get("label") == home]
+        if home and home not in self.chats and labelled and not is_reconnect:
+            logger.warning("[ghostly] home chat %s is a label: cron reports won't reach its session; "
+                           "set GHOSTLY_HOME_CHANNEL=%s", home, labelled[0])
         return True
 
     async def disconnect(self) -> None:

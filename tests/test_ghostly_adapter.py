@@ -553,6 +553,21 @@ def test_inbound_off_by_default_never_listens(env):
     assert not any(c[0] == "listen" for c in calls(tmp))
 
 
+def test_home_chat_given_as_a_label_warns_at_start_with_the_id(env, monkeypatch, caplog):
+    # Hermes mirrors a cron delivery into the session whose origin chat_id is the target as given: a label never matches.
+    mod, _, _ = env
+    monkeypatch.setenv("GHOSTLY_HOME_CHANNEL", "owner")
+    caplog.set_level("WARNING")
+    assert run(make_adapter(mod, inbound=False)[0].connect()) is True
+    assert [r.getMessage() for r in caplog.records if "home chat" in r.getMessage()] == [
+        "[ghostly] home chat owner is a label: cron reports won't reach its session; set GHOSTLY_HOME_CHANNEL=OWNERDM"]
+    caplog.clear()
+    run(make_adapter(mod, inbound=False)[0].connect(is_reconnect=True))   # a reconnect's fresh adapter says it once only
+    monkeypatch.setenv("GHOSTLY_HOME_CHANNEL", "OWNERDM")
+    run(make_adapter(mod, inbound=False)[0].connect())
+    assert not [r for r in caplog.records if r.levelname == "WARNING"]
+
+
 def test_delegate_speaks_for_the_owner_but_keeps_the_exceptions_in_the_prompt(env):
     mod, _, chats = env
     data = json.loads(chats.read_text())

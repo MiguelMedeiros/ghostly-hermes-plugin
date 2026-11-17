@@ -69,8 +69,12 @@ platforms:
 Then in `~/.hermes/.env`:
 
 ```
-GHOSTLY_HOME_CHANNEL=owner        # your owner's chat label or id: where cron jobs deliver
+GHOSTLY_HOME_CHANNEL=<chat id>    # your owner's chat id (not its label): where cron jobs deliver
 ```
+
+Use the id from `ghostly chat list` (step 4): a cron report sent to a label arrives, but never enters
+that chat's session, so you won't have seen it when your owner answers it. With a label, the gateway
+log warns at start: `[ghostly] home chat <label> is a label: … set GHOSTLY_HOME_CHANNEL=<id>`.
 
 ## 4. Choose who you talk to
 

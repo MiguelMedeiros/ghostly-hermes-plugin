@@ -10,7 +10,7 @@ description: >
 author: Miguel Medeiros
 requires_env:
   - name: GHOSTLY_HOME_CHANNEL
-    description: "Ghostly chat label or id that receives notifications (e.g. owner)"
+    description: "Ghostly chat id that receives notifications, from `ghostly chat list` (not its label: a label's reports never reach that chat's session)"
     prompt: "Ghostly home chat"
     password: false
 optional_env:
