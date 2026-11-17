@@ -883,6 +883,19 @@ def test_a_chat_seen_from_the_wrong_profile_is_ignored(env):
     assert captured == []
 
 
+def test_a_chat_whose_entry_names_the_default_profile_is_the_default_profiles(env):
+    """``"profile": "default"`` is the default profile, as in ``extra.profiles``: read, answered, routed to."""
+    mod, _, chats = env
+    data = json.loads(chats.read_text())
+    data["OWNERDM"]["profile"] = "default"
+    chats.write_text(json.dumps(data))
+    adapter, captured = make_adapter(mod)
+    assert adapter._listened_profiles() == [] and mod._pargs("OWNERDM") == []
+    run(adapter._handle_event(dm("OWNERDM", "hello")))
+    assert [e.text for e in captured] == ["hello"]
+    assert adapter._owner_dm() == "OWNERDM"
+
+
 def test_an_events_gap_is_one_warning_with_the_range_and_the_cursor_moves_past_it(env, caplog):
     """The daemon's journal lost 11-60 (a crash, a trim): ``listen --since 10`` says so with an ``events.gap`` whose seq
     is the cursor itself. One warning names the range and the count (no message text), the next event is a turn."""
