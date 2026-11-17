@@ -63,6 +63,9 @@ _FALLBACK_BIN = os.path.expanduser("~/.local/bin/ghostly")
 GROUP_PREFIX = "group:"
 PEER_ROLES = frozenset({"coordinator", "agent_peer"})
 _APPROVAL_CHOICES = frozenset({"once", "session", "always", "deny"})
+# Received files (<state>/media) older than this go on the first save after a start, then at most every
+# MEDIA_PRUNE_EVERY_SECONDS; ``extra.media_max_age_days`` sets it, 0 keeps them all. Hermes's own media caches keep 24 h.
+MEDIA_MAX_AGE_DAYS, MEDIA_PRUNE_EVERY_SECONDS = 7, 6 * 3600
 DEFAULT_OWNER_NAME = "the owner"
 DEFAULT_AGENT_NAME = "Hermes"
 # chat id -> the Ghostly profile it lives in, for chats outside the default profile (published from the allowlist).
@@ -390,6 +393,11 @@ class GhostlyAdapter(BasePlatformAdapter):
         self.state_dir = self.chats_file.parent
         self.cursor_file = self.state_dir / "cursor"
         self.media_dir = self.state_dir / "media"
+        try:
+            self.media_max_age = max(0.0, float(extra.get("media_max_age_days", MEDIA_MAX_AGE_DAYS))) * 86400
+        except (TypeError, ValueError):
+            self.media_max_age = MEDIA_MAX_AGE_DAYS * 86400
+        self._media_pruned_at = 0.0
         self.chats: Dict[str, dict] = {}
         self._chats_mtime = 0.0
         self.owner_keys_file = Path(os.path.expanduser(
@@ -884,7 +892,27 @@ class GhostlyAdapter(BasePlatformAdapter):
         self._seen_tasks.add(task)
         task.add_done_callback(self._seen_tasks.discard)
 
+    def _prune_media(self) -> int:
+        """Delete received files older than ``media_max_age``; returns how many went."""
+        now = time.time()
+        self._media_pruned_at = now
+        if self.media_max_age <= 0 or not self.media_dir.is_dir():
+            return 0
+        removed, freed = 0, 0
+        for path in self.media_dir.iterdir():
+            with contextlib.suppress(OSError):
+                st = path.stat()
+                if path.is_file() and st.st_mtime < now - self.media_max_age:
+                    path.unlink()
+                    removed, freed = removed + 1, freed + st.st_size
+        if removed:
+            logger.info("[ghostly] removed %d received file(s) older than %g days (%.1f MB)", removed,
+                        self.media_max_age / 86400, freed / 1048576)
+        return removed
+
     async def _save_file(self, f: dict, chat_id: str = "") -> Optional[str]:
+        if time.time() - self._media_pruned_at >= MEDIA_PRUNE_EVERY_SECONDS:
+            self._prune_media()
         self.media_dir.mkdir(parents=True, exist_ok=True)
         name = os.path.basename(str(f.get("name") or "file")) or "file"
         path = self.media_dir / f"{int(time.time())}-{str(f['id'])[:12]}-{name}"

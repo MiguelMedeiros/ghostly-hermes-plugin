@@ -543,6 +543,38 @@ def _with_tester(chats):
     chats.write_text(json.dumps(data))
 
 
+def test_received_files_older_than_the_media_age_are_pruned_at_start_and_while_saving(env, monkeypatch):
+    """Received files go to <state>/media and nothing removed them: a Mac gateway kept 203 files (148 MB) since its
+    first day. Files older than ``media_max_age_days`` (default 7) go on the first save after a start, then at most
+    every 6 h."""
+    import time
+    mod, tmp, _ = env
+    adapter, captured = make_adapter(mod)
+    media = adapter.media_dir
+    media.mkdir(parents=True)
+    now = time.time()
+    for name, age_days in (("old-voice.webm", 30), ("week-old.png", 7.5), ("yesterday.png", 1), ("today.pdf", 0)):
+        p = media / name
+        p.write_text("x")
+        os.utime(p, (now - age_days * 86400, now - age_days * 86400))
+    monkeypatch.setattr(mod.time, "time", lambda: now)
+    run(adapter._handle_event(dm("OWNERDM", "f0", file={"id": "F0", "name": "z.png", "mime": "image/png", "size": 5})))
+    assert sorted(p.name for p in media.iterdir() if "-F0-" not in p.name) == ["today.pdf", "yesterday.png"]
+    # a save soon after does not walk the folder again; one 6 h later does
+    os.utime(media / "yesterday.png", (now - 8 * 86400, now - 8 * 86400))
+    run(adapter._handle_event(dm("OWNERDM", "f1", file={"id": "F1", "name": "a.png", "mime": "image/png", "size": 5})))
+    assert (media / "yesterday.png").exists()
+    monkeypatch.setattr(mod.time, "time", lambda: now + 6 * 3600 + 1)
+    run(adapter._handle_event(dm("OWNERDM", "f2", file={"id": "F2", "name": "b.png", "mime": "image/png", "size": 5})))
+    assert not (media / "yesterday.png").exists()
+    assert len(captured) == 3 and all(Path(e.media_urls[0]).exists() for e in captured)
+    # 0 keeps everything; a value that is not a number falls back to the default
+    keep, _ = make_adapter(mod, media_max_age_days=0)
+    assert keep._prune_media() == 0 and (media / "today.pdf").exists()
+    bad, _ = make_adapter(mod, media_max_age_days="soon")
+    assert bad.media_max_age == 7 * 86400
+
+
 def test_a_second_profile_is_listened_to_with_its_own_cursor_and_answered_through_it(env):
     """The test chat lives in the ``testing`` profile: read with ``-p testing``, answered the same way."""
     mod, tmp, chats = env
