@@ -6,6 +6,7 @@ Run with ``tests/run`` from the repo root: it finds the Hermes Agent's Python an
 import asyncio
 import importlib.util
 import json
+import logging
 import os
 import stat
 import sys
@@ -482,6 +483,45 @@ def test_first_listen_starts_at_the_current_seq_and_advances_the_cursor(env):
     assert adapter._read_cursor() == 42 and captured[0].text == "new"
 
 
+def test_a_file_being_saved_holds_only_its_own_chat(env):
+    """A received file can take minutes to save: the other chats' messages go on meanwhile, the same chat's next
+    messages keep their order behind it, and the cursor stays before the file until it is saved."""
+    mod, tmp, _ = env
+    fake = tmp / "ghostly"                         # `file save` waits until the test creates <tmp>/release
+    fake.write_text(fake.read_text().replace(
+        '"file save") shift 2;', '"file save") while [ ! -e "$dir/release" ]; do sleep 0.05; done; shift 2;'))
+    events = [dm("PEERDM", "", file={"id": "F1", "name": "big.bin"}) | {"seq": 60},
+              dm("PEERDM", "did it arrive?") | {"seq": 61},
+              dm("OWNERDM", "are you there?") | {"seq": 62}]
+    (tmp / "events.jsonl").write_text("".join(json.dumps(e) + "\n" for e in events))
+    adapter, captured = make_adapter(mod)
+    adapter._running = True
+
+    async def until(done):
+        for _ in range(100):
+            await asyncio.sleep(0.05)
+            if done():
+                break
+
+    async def scenario():
+        task = asyncio.create_task(adapter._listen_loop())
+        await until(lambda: captured)
+        while_saving = ([e.source.chat_id for e in captured], adapter._read_cursor())
+        (tmp / "release").write_text("")
+        await until(lambda: len(captured) == 3)
+        await asyncio.sleep(0.05)
+        adapter._running = False
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        return while_saving
+
+    assert run(scenario()) == (["OWNERDM"], 59)
+    assert [(e.source.chat_id, bool(e.media_urls), e.text) for e in captured[1:]] == [
+        ("PEERDM", True, ""), ("PEERDM", False, "did it arrive?")]
+    assert adapter._read_cursor() == 62
+
+
 def test_gateway_notices_never_reach_a_ghostly_chat_and_the_owner_gets_a_short_line(env):
     """The gateway's silence warning (the one the gateway really produces, in any catalog language) and its other
     error notices stay in the log: groups and peers get nothing, the owner's DM gets "👀 seen" / a short error line."""
@@ -504,6 +544,70 @@ def test_gateway_notices_never_reach_a_ghostly_chat_and_the_owner_gets_a_short_l
     assert mod.OWNER_ERROR_REPLY in "".join(sent[1]) and FAILED_TURN_NOTICE not in "".join(sent[1])
     assert run(adapter.send("group:G1", "a normal reply")).success      # normal replies are untouched
     assert "a normal reply" in "".join(calls(tmp)[-1])
+
+
+def _walk_every_catalog(mod, content):
+    """The notice check as it was before the map was cached: every catalog walked on every call."""
+    from agent.i18n import _load_catalog, supported_languages
+    from agent.turn_failure_copy import FAILED_TURN_NOTICE, PARTIAL_FAILED_TURN_NOTICE
+    prefixes = {}
+    for lang in supported_languages():
+        for key, text in _load_catalog(lang).items():
+            if key.startswith("gateway.errors.") and isinstance(text, str):
+                prefix = text.split("{", 1)[0].strip()
+                if len(prefix) >= 20:
+                    prefixes[prefix] = "silence" if key == "gateway.errors.unexpected_silence" else "error"
+    for text in (FAILED_TURN_NOTICE, PARTIAL_FAILED_TURN_NOTICE):
+        prefixes[str(text).strip()[:80]] = "error"
+    text = (content or "").strip()
+    if text.startswith("♻️ Recovered reply") and "\n\n" in text:
+        text = text.split("\n\n", 1)[1].strip()
+    if text.startswith(mod._LIFECYCLE_PREFIXES):
+        return "status"
+    return next((kind for prefix, kind in prefixes.items() if text.startswith(prefix)), None)
+
+
+def test_the_notice_check_builds_its_map_once_and_answers_as_the_full_walk_did(env, monkeypatch):
+    """Every outbound send and edit asks whether the text is a gateway notice. The {prefix: kind} map is built once per
+    set of catalogs (not walked again per call, ~5 ms with 17 languages), gives the same answers as the walk, and is
+    built again when Hermes hands out new catalogs (reset_language_cache, a pack or overlay)."""
+    mod, _, _ = env
+    from agent import i18n
+    from agent.i18n import t
+    from agent.turn_failure_copy import FAILED_TURN_NOTICE, PARTIAL_FAILED_TURN_NOTICE
+    samples = ["", "hello", "Sure, here is the plan for tomorrow.", "⏳ Still waiting for the other Hermes process",
+               FAILED_TURN_NOTICE, PARTIAL_FAILED_TURN_NOTICE, "♻️ Recovered reply — x:\n\n" + FAILED_TURN_NOTICE]
+    for lang in i18n.supported_languages():
+        silence = t("gateway.errors.unexpected_silence", lang=lang)
+        catalog = i18n._load_catalog(lang)
+        errors = [v for k, v in sorted(catalog.items()) if k.startswith("gateway.errors.") and isinstance(v, str)]
+        samples += [silence, silence[:12], *errors[:5]]
+    builds = []
+    real_build = mod._build_notice_prefixes
+    monkeypatch.setattr(mod, "_build_notice_prefixes", lambda c: builds.append(1) or real_build(c))
+    assert [mod._gateway_notice_kind(s) for s in samples] == [_walk_every_catalog(mod, s) for s in samples]
+    assert {mod._gateway_notice_kind(s) for s in samples} == {None, "status", "error", "silence"}
+    assert len(builds) == 1
+
+    import time
+    start = time.perf_counter()
+    for _ in range(200):
+        mod._outbound_for_notice({"role": "owner"}, "Sure, here is the plan for tomorrow.")
+    assert (time.perf_counter() - start) / 200 < 0.002  # the full walk took ~5 ms per check
+    assert len(builds) == 1
+
+    # New catalogs (what reset_language_cache leads to) rebuild the map, and a new notice text is recognised.
+    i18n.reset_language_cache()
+    real_load = i18n._load_catalog
+    extra = "The tool runner went away before answering"
+
+    def load(lang, home=None):
+        catalog = real_load(lang, home)
+        return {**catalog, "gateway.errors.test_only": extra + " ({detail})"} if lang == "en" else catalog
+
+    monkeypatch.setattr(i18n, "_load_catalog", load)
+    assert mod._gateway_notice_kind(extra + " (boom)") == "error" == _walk_every_catalog(mod, extra + " (boom)")
+    assert len(builds) >= 2
 
 
 def test_unaddressed_group_messages_and_peer_dms_may_stay_silent(env):
@@ -627,6 +731,26 @@ def test_a_chat_seen_from_the_wrong_profile_is_ignored(env):
     run(adapter._handle_event(dm("BHCHAT", "on the default stream")))                 # its entry says testing
     run(adapter._handle_event(dm("OWNERDM", "on the test stream"), "testing"))  # the owner's chat is the default's
     assert captured == []
+
+
+def test_an_events_gap_is_one_warning_with_the_range_and_the_cursor_moves_past_it(env, caplog):
+    """The daemon's journal lost 11-60 (a crash, a trim): ``listen --since 10`` says so with an ``events.gap`` whose seq
+    is the cursor itself. One warning names the range and the count (no message text), the next event is a turn."""
+    mod, tmp, _ = env
+    gap = {"seq": 10, "id": "events.gap:10:61", "type": "events.gap", "at": 1790000000000, "from": 11, "to": 60}
+    owner = dm("OWNERDM", "still there?") | {"seq": 61}
+    (tmp / "events.jsonl").write_text(json.dumps(gap) + "\n" + json.dumps(owner) + "\n")
+    adapter, captured = make_adapter(mod)
+    adapter._write_cursor(10)
+    with caplog.at_level(logging.INFO):
+        _one_listen_round(adapter, captured)
+    listen = next(c for c in calls(tmp) if c[0] == "listen")
+    assert listen[listen.index("--since") + 1] == "10"
+    gaps = [r for r in caplog.records if "events.gap" in r.getMessage()]
+    assert len(gaps) == 1 and gaps[0].levelno == logging.WARNING
+    assert "events 11-60 (50) were lost" in gaps[0].getMessage()
+    assert not any("still there?" in r.getMessage() for r in caplog.records)
+    assert [e.text for e in captured] == ["still there?"] and adapter._read_cursor() == 61
 
 
 def test_new_chats_of_a_second_profile_are_discovered_there_and_remember_it(env):
