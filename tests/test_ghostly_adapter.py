@@ -513,6 +513,27 @@ def test_a_tap_on_my_own_approval_in_the_group_still_resolves_it(env, monkeypatc
     assert resolved == ["once"] and captured == []
 
 
+def test_a_dropped_gateway_notice_is_logged_at_info_with_its_first_line_only(env, caplog):
+    """Keeping a notice out of a group or a peer is the policy working, not a fault: it goes to agent.log at INFO, so
+    errors.log (WARNING and up) stays for real failures, and only the notice's first line is copied into the log."""
+    import logging
+    mod, tmp, _ = env
+    adapter, _ = make_adapter(mod)
+    from gateway.run_turn import _unexpected_silence_reply
+    from agent.turn_failure_copy import FAILED_TURN_NOTICE
+    caplog.set_level(logging.INFO, logger=mod.logger.name)
+    notice = FAILED_TURN_NOTICE + "\nsecond line with details"
+    for _ in range(20):
+        assert run(adapter.send("group:G1", notice)).success
+    assert run(adapter.send("PEERDM", _unexpected_silence_reply())).success
+    assert run(adapter.edit_message("group:G1", "m9", notice)).success
+    assert calls(tmp) == []
+    ours = [r for r in caplog.records if r.name == mod.logger.name and "kept out" in r.getMessage()]
+    assert len(ours) == 22
+    assert [r for r in ours if r.levelno >= logging.WARNING] == []
+    assert all("second line" not in r.getMessage() for r in ours)
+
+
 def test_owner_dm_is_never_told_to_answer_with_a_silence_marker(env):
     mod, _, _ = env
     assert "NO_REPLY" not in mod.PLATFORM_HINT

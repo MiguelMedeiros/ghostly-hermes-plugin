@@ -202,6 +202,11 @@ def _outbound_for_notice(chat: Dict[str, Any], content: str) -> Optional[str]:
     return OWNER_SILENCE_REPLY if kind == "silence" else OWNER_ERROR_REPLY
 
 
+def _first_line(content: str, limit: int = 120) -> str:
+    """The first line of a notice, cut to ``limit``: what the log needs to tell notices apart, without the body."""
+    return ((content or "").strip().splitlines() or [""])[0][:limit]
+
+
 def _is_silence_fallback(chat: Dict[str, Any], content: str) -> bool:
     """The gateway's warning for a bare NO_REPLY, in a chat where NO_REPLY is the instructed answer."""
     return chat.get("role", "contact") != "owner" and _gateway_notice_kind(content) == "silence"
@@ -905,8 +910,9 @@ class GhostlyAdapter(BasePlatformAdapter):
         chat = self.chats.get(chat_id) or {"role": "group" if chat_id.startswith(GROUP_PREFIX) else "contact"}
         replacement = _outbound_for_notice(chat, content)
         if replacement is not None:
-            logger.warning("[ghostly] gateway notice kept out of %s (%s): %s", chat_id,
-                           "dropped" if not replacement else f"sent {replacement!r} instead", content.strip()[:300])
+            # The policy working, not a fault: INFO keeps errors.log for failures, and one line of the notice is enough.
+            logger.info("[ghostly] gateway notice kept out of %s (%s): %s", chat_id,
+                        "dropped" if not replacement else f"sent {replacement!r} instead", _first_line(content))
             if not replacement:
                 return SendResult(success=True)
             content = replacement
@@ -924,7 +930,7 @@ class GhostlyAdapter(BasePlatformAdapter):
         chat = self.chats.get(chat_id) or {"role": "group" if chat_id.startswith(GROUP_PREFIX) else "contact"}
         replacement = _outbound_for_notice(chat, content)
         if replacement is not None:
-            logger.warning("[ghostly] gateway notice kept out of an edit in %s: %s", chat_id, content.strip()[:300])
+            logger.info("[ghostly] gateway notice kept out of an edit in %s: %s", chat_id, _first_line(content))
             if not replacement:
                 return SendResult(success=True, message_id=message_id)
             content = replacement
