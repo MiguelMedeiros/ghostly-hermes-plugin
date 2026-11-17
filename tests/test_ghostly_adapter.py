@@ -6,9 +6,11 @@ Run with ``tests/run`` from the repo root: it finds the Hermes Agent's Python an
 import asyncio
 import importlib.util
 import json
+import logging
 import os
 import stat
 import sys
+import time
 from pathlib import Path
 
 import pytest
@@ -24,11 +26,13 @@ for a in "$@"; do [ "$a" = "--stdin" ] && stdin="$(cat)"; done
 printf '%s\n' "$(printf '%s\x1f' "$@")STDIN=$stdin" >> "$log"
 prof=""; if [ "$1" = "-p" ]; then prof="$2"; shift 2; fi
 case "$1 $2" in
-  "status "*) echo '{"events":{"lastSeq":41}}';;
+  "status "*) if [ -e "$dir/status-busy" ]; then echo 'Profile default is in use' >&2; exit 1; fi
+     if [ -e "$dir/status-no-events" ]; then echo '{"profile":"default"}'; else echo '{"events":{"lastSeq":41}}'; fi;;
   "chat list") cat "$dir/chats.json";;
   "group show") cat "$dir/group.json";;
   "file save") shift 2; p=""; while [ $# -gt 0 ]; do [ "$1" = "--path" ] && p="$2"; shift; done; echo data > "$p"; echo '{"saved":true}';;
-  "listen "*) if [ -n "$prof" ]; then cat "$dir/events-$prof.jsonl"; else cat "$dir/events.jsonl"; fi;;
+  "listen "*) if [ -f "$dir/listen-error" ]; then cat "$dir/listen-error" >&2; exit 1; fi
+             if [ -n "$prof" ]; then cat "$dir/events-$prof.jsonl"; else cat "$dir/events.jsonl"; fi;;
   *) if [ "$1" = "send" ] && printf '%s' "$stdin" | grep -q SECRETSEED; then echo '{"error":{"code":"secret"}}'; exit 5; fi
      echo '{"messageId":"m1","delivery":"sent"}';;
 esac
@@ -150,6 +154,57 @@ def test_group_is_one_shared_session_with_author_prefix_and_mentions_gate(env):
     assert owner.text == "[Ana] go on" and owner.allow_gateway_control is True
 
 
+def late_mention(gid, member, text, **extra):
+    """``group.mentioned`` (CLI 1.11): a mention of this profile learned after the message's ``group.message``."""
+    event = grp(gid, member, text, mentioned=True, **extra)
+    return {**event, "seq": 52, "id": f"group.mentioned:{gid}:g1", "type": "group.mentioned", "messageId": "g1"}
+
+
+def test_a_mention_learned_after_the_message_starts_the_turn_the_mentions_gate_dropped(env):
+    """The copy that reached us first named no one (dropped in a mentions_only group); the author's copy, or an edit,
+    names me later and arrives as ``group.mentioned``: that is the turn, once."""
+    mod, tmp, _ = env
+    (tmp / "events.jsonl").write_text(
+        json.dumps(grp("G1", "BOTKEY", "@Hermes rebase?")) + "\n"
+        + json.dumps(late_mention("G1", "BOTKEY", "@Hermes rebase?")) + "\n")
+    adapter, captured = make_adapter(mod)
+    _one_listen_round(adapter, captured)
+    listen = next(c for c in calls(tmp) if c[0] == "listen")
+    assert "group.mentioned" in [listen[i + 1] for i, a in enumerate(listen) if a == "--type"]
+    assert [e.text for e in captured] == ["[Peer] @Hermes rebase?"]
+    turn = captured[0]
+    assert turn.source.chat_id == "group:G1" and turn.reply_expected is True and turn.allow_gateway_control is False
+    assert adapter._read_cursor() == 52
+
+
+def test_a_late_mention_never_doubles_a_turn_the_message_already_started(env):
+    """The owner and a delegate are read without a mention, and a group without mentions_only reads everyone: their
+    ``group.message`` was the turn already."""
+    mod, tmp, chats = env
+    data = json.loads(chats.read_text())
+    data["group:G1"]["members"]["DELEGATEKEY"] = {"name": "Deputy", "delegate": True}
+    data["group:G3"] = {"label": "all", "name": "the open group", "role": "group", "members": {}}
+    chats.write_text(json.dumps(data))
+    adapter, captured = make_adapter(mod)
+    read_group(adapter, grp("G1", "OWNERKEY", "and you?"), late_mention("G1", "OWNERKEY", "and you, @Hermes?"),
+               grp("G1", "DELEGATEKEY", "go on"), late_mention("G1", "DELEGATEKEY", "go on @Hermes"),
+               grp("G3", "BOTKEY", "anyone?"), late_mention("G3", "BOTKEY", "anyone? @Hermes"))
+    assert [e.text for e in captured] == ["[Ana] and you?", "[Deputy] go on", "[BOTKEY] anyone?"]
+    assert len(reacts(tmp)) == 1                    # the owner's message, once
+
+
+def test_a_message_the_mentions_gate_drops_is_logged_without_its_text(env, caplog):
+    import logging
+    mod, _, _ = env
+    adapter, captured = make_adapter(mod)
+    with caplog.at_level(logging.INFO, logger=mod.logger.name):
+        run(adapter._handle_event(grp("G1", "BOTKEY", "talking among themselves")))
+    assert captured == []
+    dropped = [r.getMessage() for r in caplog.records if "mention" in r.getMessage()]
+    assert len(dropped) == 1 and "group:G1" in dropped[0] and "g1" in dropped[0] and "BOTKEY"[:8] in dropped[0]
+    assert "talking among themselves" not in caplog.text
+
+
 def test_owner_messages_get_a_seen_reaction_right_away_and_others_do_not(env):
     """The owner gets a 👀 on each message the moment it is read: their DM, and all they write in a group."""
     mod, tmp, _ = env
@@ -172,6 +227,92 @@ def test_owner_messages_get_a_seen_reaction_right_away_and_others_do_not(env):
 
 def reacts(tmp):
     return [c[:-1] for c in calls(tmp) if "react" in c[:2]]
+
+
+SLOW_REACT = r"""#!/usr/bin/env bash
+# Wraps the fake CLI: a react stays alive $FAKE_REACT_SECONDS and notes how many reacts are alive with it; a message
+# id with "bad" in it fails.
+case " $* " in
+  *" react "*)
+    live="$FAKE_DIR/live"; mkdir -p "$live"; touch "$live/$$"
+    ls "$live" | wc -l | tr -d ' ' >> "$FAKE_DIR/react-peaks"
+    sleep "$FAKE_REACT_SECONDS"; rm -f "$live/$$"
+    case " $* " in *" bad"*) echo '{"error":{"code":"offline"}}'; exit 1;; esac;;
+esac
+exec "$FAKE_REAL" "$@"
+"""
+
+
+def slow_reacts(tmp, monkeypatch, seconds):
+    wrapper = tmp / "ghostly-slow-react"
+    wrapper.write_text(SLOW_REACT)
+    wrapper.chmod(wrapper.stat().st_mode | stat.S_IEXEC)
+    monkeypatch.setenv("FAKE_REAL", os.environ["GHOSTLY_BIN"])
+    monkeypatch.setenv("GHOSTLY_BIN", str(wrapper))
+    monkeypatch.setenv("FAKE_REACT_SECONDS", str(seconds))
+
+
+def owner_dm(n):
+    event = dm("OWNERDM", f"message {n}")
+    event["message"]["id"] = f"m{n}"
+    return event
+
+
+async def reacts_done(adapter):
+    while adapter._seen_tasks:
+        await asyncio.gather(*list(adapter._seen_tasks), return_exceptions=True)
+
+
+def test_a_burst_of_owner_messages_runs_a_few_reacts_at_a_time_and_skips_the_oldest(env, monkeypatch):
+    """40 owner messages at once (a catch-up after a restart): every turn starts right away, at most
+    SEEN_REACTS_AT_ONCE react processes are alive at any moment, and the newest messages still get their 👀."""
+    mod, tmp, _ = env
+    slow_reacts(tmp, monkeypatch, 0.3)
+    adapter, captured = make_adapter(mod)
+
+    async def burst():
+        for n in range(40):
+            await adapter._handle_event(owner_dm(n))
+        assert len(captured) == 40                      # no turn waited on a reaction
+        await reacts_done(adapter)
+
+    run(burst())
+    peak = max(int(n) for n in (tmp / "react-peaks").read_text().split())
+    reacted = [c[2] for c in reacts(tmp)]
+    assert peak <= mod.SEEN_REACTS_AT_ONCE
+    assert len(reacted) <= mod.SEEN_REACTS_AT_ONCE + mod.SEEN_REACTS_QUEUED
+    assert set(reacted) >= {f"m{n}" for n in range(40 - mod.SEEN_REACTS_QUEUED, 40)}
+    assert not adapter._seen_pending and not adapter._seen_tasks
+
+
+def test_a_few_owner_messages_all_get_a_seen_reaction_and_a_failed_react_breaks_nothing(env, monkeypatch):
+    """A react the CLI refuses, or one that raises, is logged; the reacts behind it and every turn still go on."""
+    mod, tmp, _ = env
+    slow_reacts(tmp, monkeypatch, 0.05)
+    monkeypatch.setattr(mod, "SEEN_REACTS_AT_ONCE", 1)     # one worker: a failure that killed it would strand the rest
+    real_cli = mod._cli
+
+    async def cli(args, *a, **kw):
+        if "boom" in args:
+            raise OSError("the CLI vanished")
+        return await real_cli(args, *a, **kw)
+
+    monkeypatch.setattr(mod, "_cli", cli)
+    adapter, captured = make_adapter(mod)
+    ids = ["boom", "bad1", "ok1", "bad2", "ok2"]
+
+    async def read_all():
+        for n, mid in enumerate(ids):
+            event = owner_dm(n)
+            event["message"]["id"] = mid
+            await adapter._handle_event(event)
+        await reacts_done(adapter)
+
+    run(read_all())
+    assert len(captured) == len(ids)
+    assert [c[2] for c in reacts(tmp)] == ["ok1", "ok2"]   # the refused ones exit before the fake logs them
+    assert len((tmp / "react-peaks").read_text().split()) == 4
+    assert not adapter._seen_pending and not adapter._seen_tasks
 
 
 def list_owner_keys(tmp, *keys, mtime=None):
@@ -336,6 +477,25 @@ def test_allowlist_edits_are_picked_up_without_restart(env):
     assert captured[0].allow_gateway_control is True
 
 
+def test_an_allowlist_being_edited_is_never_written_over(env):
+    mod, _, chats = env
+    adapter, captured = make_adapter(mod)
+    for n, broken in enumerate([
+            chats.read_text()[:-1] + ', "FRIENDDM": {"label": "friend", "role": "contact"},}',  # trailing comma
+            json.dumps([{"OWNERDM": {"role": "owner"}}])]):                                        # not an object
+        chats.write_text(broken)
+        os.utime(chats, (1, 2_000_000_000 + n))
+        run(adapter._handle_event(dm("newdm", f"hello {n}")))
+        assert chats.read_text() == broken
+    # The previous allowlist stays in use, the new chat too; once the file reads again its next message saves it.
+    assert [e.text for e in captured] == ["hello 0", "hello 1"]
+    assert {"OWNERDM", "newdm"} <= set(adapter.config.extra["allow_from"])
+    chats.write_text(json.dumps({"OWNERDM": {"label": "owner", "name": "Ana", "role": "owner"}}))
+    os.utime(chats, (1, 2_000_000_100))
+    run(adapter._handle_event(dm("newdm", "hello again")))
+    assert set(json.loads(chats.read_text())) == {"OWNERDM", "newdm"}
+
+
 def test_received_file_is_saved_and_typed(env):
     mod, tmp, _ = env
     adapter, captured = make_adapter(mod)
@@ -446,6 +606,107 @@ def test_first_listen_starts_at_the_current_seq_and_advances_the_cursor(env):
     assert adapter._read_cursor() == 42 and captured[0].text == "new"
 
 
+def test_a_failing_listen_logs_the_clis_reason_and_retries_at_most_every_retry_max(env, monkeypatch, caplog):
+    """While the daemon is down every ``listen`` fails: the log says why, and the retries stay frequent enough that the
+    owner's first message after the daemon is back is read within RETRY_MAX, not a minute and a half later."""
+    import logging
+    mod, tmp, _ = env
+    (tmp / "listen-error").write_text("starting\ndaemon: socket closed (ECONNREFUSED)\n\n")
+    adapter, _ = make_adapter(mod)
+    adapter._running = True
+    monkeypatch.setattr(mod.random, "uniform", lambda a, b: b)      # the worst jitter every time
+    real_sleep, waits = asyncio.sleep, []
+
+    async def fake_sleep(seconds, *args):
+        waits.append(seconds)
+        if len(waits) >= 10:  # a long outage
+            adapter._running = False
+        await real_sleep(0)
+
+    monkeypatch.setattr(asyncio, "sleep", fake_sleep)
+    with caplog.at_level(logging.INFO):
+        run(asyncio.wait_for(adapter._listen_loop(), 30))
+    exits = [r.getMessage() for r in caplog.records if "listen exited" in r.getMessage()]
+    assert len(exits) == 10
+    assert all(m == "[ghostly] listen exited with 1: daemon: socket closed (ECONNREFUSED)" for m in exits)
+    assert waits[0] < mod.RETRY_MAX and max(waits) == mod.RETRY_MAX <= 15
+
+
+@pytest.mark.parametrize("trouble", ["status-busy", "status-no-events"])
+def test_first_listen_waits_for_the_current_seq_instead_of_replaying_the_journal(env, monkeypatch, trouble):
+    """With no cursor, a ``status`` that fails ("Profile default is in use" while the daemon starts) or has no
+    ``events.lastSeq`` must not become ``--since 0``: no cursor is written and nothing listens until it answers."""
+    mod, tmp, _ = env
+    monkeypatch.setattr(mod, "RETRY_INITIAL", 0.05)
+    (tmp / trouble).write_text("")
+    (tmp / "events.jsonl").write_text(json.dumps(dm("OWNERDM", "new") | {"seq": 42}) + "\n")
+    adapter, captured = make_adapter(mod)
+    adapter._running = True
+
+    async def rounds():
+        task = asyncio.create_task(adapter._listen_loop())
+        for _ in range(100):
+            await asyncio.sleep(0.05)
+            if sum(c[0] == "status" for c in calls(tmp)) >= 2:
+                break
+        assert not adapter._cursor_path().exists()
+        assert not any("listen" in c for c in calls(tmp)) and captured == []
+        (tmp / trouble).unlink()                       # the daemon is up now
+        for _ in range(100):
+            await asyncio.sleep(0.05)
+            if captured:
+                break
+        adapter._running = False
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+    run(rounds())
+    assert sum(c[0] == "status" for c in calls(tmp)) >= 3
+    listen = next(c for c in calls(tmp) if c[0] == "listen")
+    assert listen[listen.index("--since") + 1] == "41"
+    assert adapter._read_cursor() == 42 and captured[0].text == "new"
+
+
+def test_a_file_being_saved_holds_only_its_own_chat(env):
+    """A received file can take minutes to save: the other chats' messages go on meanwhile, the same chat's next
+    messages keep their order behind it, and the cursor stays before the file until it is saved."""
+    mod, tmp, _ = env
+    fake = tmp / "ghostly"                         # `file save` waits until the test creates <tmp>/release
+    fake.write_text(fake.read_text().replace(
+        '"file save") shift 2;', '"file save") while [ ! -e "$dir/release" ]; do sleep 0.05; done; shift 2;'))
+    events = [dm("PEERDM", "", file={"id": "F1", "name": "big.bin"}) | {"seq": 60},
+              dm("PEERDM", "did it arrive?") | {"seq": 61},
+              dm("OWNERDM", "are you there?") | {"seq": 62}]
+    (tmp / "events.jsonl").write_text("".join(json.dumps(e) + "\n" for e in events))
+    adapter, captured = make_adapter(mod)
+    adapter._running = True
+
+    async def until(done):
+        for _ in range(100):
+            await asyncio.sleep(0.05)
+            if done():
+                break
+
+    async def scenario():
+        task = asyncio.create_task(adapter._listen_loop())
+        await until(lambda: captured)
+        while_saving = ([e.source.chat_id for e in captured], adapter._read_cursor())
+        (tmp / "release").write_text("")
+        await until(lambda: len(captured) == 3)
+        await asyncio.sleep(0.05)
+        adapter._running = False
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        return while_saving
+
+    assert run(scenario()) == (["OWNERDM"], 59)
+    assert [(e.source.chat_id, bool(e.media_urls), e.text) for e in captured[1:]] == [
+        ("PEERDM", True, ""), ("PEERDM", False, "did it arrive?")]
+    assert adapter._read_cursor() == 62
+
+
 def test_gateway_notices_never_reach_a_ghostly_chat_and_the_owner_gets_a_short_line(env):
     """The gateway's silence warning (the one the gateway really produces, in any catalog language) and its other
     error notices stay in the log: groups and peers get nothing, the owner's DM gets "👀 seen" / a short error line."""
@@ -468,6 +729,137 @@ def test_gateway_notices_never_reach_a_ghostly_chat_and_the_owner_gets_a_short_l
     assert mod.OWNER_ERROR_REPLY in "".join(sent[1]) and FAILED_TURN_NOTICE not in "".join(sent[1])
     assert run(adapter.send("group:G1", "a normal reply")).success      # normal replies are untouched
     assert "a normal reply" in "".join(calls(tmp)[-1])
+
+
+def test_the_first_send_never_loads_the_catalogs_on_the_loop(env, monkeypatch):
+    """Parsing the 17 locale catalogs takes seconds with the pure-Python YAML parser: the first send must not do it on
+    the gateway's loop. connect() loads them in the background; then a notice in any catalog language is caught."""
+    mod, tmp, _ = env
+    from agent import i18n_layers
+    from agent.i18n import _catalog_cache, _current_home, supported_languages, t
+    parse = i18n_layers.parse_locale_file
+
+    def slow_parse(path):
+        time.sleep(0.05)  # 17 files: ~0.85 s, a fraction of what the pure-Python parser takes on a loaded host
+        return parse(path)
+
+    monkeypatch.setattr(i18n_layers, "parse_locale_file", slow_parse)
+    adapter, _ = make_adapter(mod, inbound=False)
+
+    async def first_send():
+        gaps, done = [], asyncio.Event()
+
+        async def heartbeat():
+            last = time.perf_counter()
+            while not done.is_set():
+                await asyncio.sleep(0.005)
+                now = time.perf_counter()
+                gaps.append(now - last)
+                last = now
+
+        beat = asyncio.create_task(heartbeat())
+        await asyncio.sleep(0.02)
+        result = await adapter.send("OWNERDM", "a normal reply")
+        done.set()
+        await beat
+        return result, max(gaps)
+
+    result, stall = run(first_send())
+    assert result.success
+    assert stall < 0.3, f"the first send blocked the loop for {stall:.3f} s"
+    assert run(adapter.connect()) is True
+    home = _current_home()
+    mod._notice_warmups[home].join(timeout=60)
+    assert all((home, lang) in _catalog_cache for lang in supported_languages(home))
+    assert run(adapter.send("group:G1", t("gateway.errors.unexpected_silence", lang="de"))).success
+    assert not [c for c in calls(tmp) if "G1" in c]
+
+
+def test_tool_progress_stays_out_of_groups_and_reaches_dms(env):
+    """The tool feed ("✍️ Writing …", "💻 Running …", a command block) is dropped in a group, sends and edits alike;
+    DMs keep it, and a group's short status lines (▶️ / ✅ / ⚠️ / 🔴) still go out."""
+    mod, tmp, _ = env
+    adapter, _ = make_adapter(mod)
+    feed = "📚 Reading skill \"ghostly-chat\"\n✍️ Writing ~/code/x.md\n💻 Running\n```\ngit status\n```"
+    assert run(adapter.send("group:G1", feed)).success
+    assert run(adapter.send("group:G1", "✍️ Writing NOTES.md")).success
+    assert run(adapter.edit_message("group:G1", "m9", feed + "\n🔍 Searching files")).success
+    assert calls(tmp) == []
+    for status in ("▶️ started on the release notes", "✅ PR merged", "⚠️ CI is red", "PR opened",
+                   "🔴 blocked: the Desktop CI"):
+        assert run(adapter.send("group:G1", status)).success
+    sent = ["".join(c) for c in calls(tmp)]
+    assert len(sent) == 5 and "blocked" in sent[-1]
+    log = tmp / "calls.log"
+    assert run(adapter.send("OWNERDM", feed)).success
+    assert log.read_text().count("Reading skill") == 1
+    assert run(adapter.send("PEERDM", feed)).success
+    assert log.read_text().count("Reading skill") == 2
+
+
+def _walk_every_catalog(mod, content):
+    """The notice check as it was before the map was cached: every catalog walked on every call."""
+    from agent.i18n import _load_catalog, supported_languages
+    from agent.turn_failure_copy import FAILED_TURN_NOTICE, PARTIAL_FAILED_TURN_NOTICE
+    prefixes = {}
+    for lang in supported_languages():
+        for key, text in _load_catalog(lang).items():
+            if key.startswith("gateway.errors.") and isinstance(text, str):
+                prefix = text.split("{", 1)[0].strip()
+                if len(prefix) >= 20:
+                    prefixes[prefix] = "silence" if key == "gateway.errors.unexpected_silence" else "error"
+    for text in (FAILED_TURN_NOTICE, PARTIAL_FAILED_TURN_NOTICE):
+        prefixes[str(text).strip()[:80]] = "error"
+    text = (content or "").strip()
+    if text.startswith("♻️ Recovered reply") and "\n\n" in text:
+        text = text.split("\n\n", 1)[1].strip()
+    if text.startswith(mod._LIFECYCLE_PREFIXES):
+        return "status"
+    return next((kind for prefix, kind in prefixes.items() if text.startswith(prefix)), None)
+
+
+def test_the_notice_check_builds_its_map_once_and_answers_as_the_full_walk_did(env, monkeypatch):
+    """Every outbound send and edit asks whether the text is a gateway notice. The {prefix: kind} map is built once per
+    set of catalogs (not walked again per call, ~5 ms with 17 languages), gives the same answers as the walk, and is
+    built again when Hermes hands out new catalogs (reset_language_cache, a pack or overlay)."""
+    mod, _, _ = env
+    from agent import i18n
+    from agent.i18n import t
+    from agent.turn_failure_copy import FAILED_TURN_NOTICE, PARTIAL_FAILED_TURN_NOTICE
+    samples = ["", "hello", "Sure, here is the plan for tomorrow.", "⏳ Still waiting for the other Hermes process",
+               FAILED_TURN_NOTICE, PARTIAL_FAILED_TURN_NOTICE, "♻️ Recovered reply — x:\n\n" + FAILED_TURN_NOTICE]
+    for lang in i18n.supported_languages():
+        silence = t("gateway.errors.unexpected_silence", lang=lang)
+        catalog = i18n._load_catalog(lang)
+        errors = [v for k, v in sorted(catalog.items()) if k.startswith("gateway.errors.") and isinstance(v, str)]
+        samples += [silence, silence[:12], *errors[:5]]
+    builds = []
+    real_build = mod._build_notice_prefixes
+    monkeypatch.setattr(mod, "_build_notice_prefixes", lambda c: builds.append(1) or real_build(c))
+    assert [mod._gateway_notice_kind(s) for s in samples] == [_walk_every_catalog(mod, s) for s in samples]
+    assert {mod._gateway_notice_kind(s) for s in samples} == {None, "status", "error", "silence"}
+    assert len(builds) == 1
+
+    import time
+    start = time.perf_counter()
+    for _ in range(200):
+        mod._outbound_for_notice({"role": "owner"}, "Sure, here is the plan for tomorrow.")
+    assert (time.perf_counter() - start) / 200 < 0.002  # the full walk took ~5 ms per check
+    assert len(builds) == 1
+
+    # New catalogs (what reset_language_cache and a pack lead to) rebuild the map, and a new notice text is recognised.
+    i18n.reset_language_cache()
+    extra = "The tool runner went away before answering"
+    home = i18n._current_home()
+    for lang in i18n.supported_languages(home):
+        i18n._load_catalog(lang, home)
+    i18n._catalog_cache[(home, "en")] = {**i18n._catalog_cache[(home, "en")],
+                                         "gateway.errors.test_only": extra + " ({detail})"}
+    try:
+        assert mod._gateway_notice_kind(extra + " (boom)") == "error" == _walk_every_catalog(mod, extra + " (boom)")
+        assert len(builds) >= 2
+    finally:
+        i18n.reset_language_cache()
 
 
 def test_unaddressed_group_messages_and_peer_dms_may_stay_silent(env):
@@ -591,6 +983,39 @@ def test_a_chat_seen_from_the_wrong_profile_is_ignored(env):
     run(adapter._handle_event(dm("BHCHAT", "on the default stream")))                 # its entry says testing
     run(adapter._handle_event(dm("OWNERDM", "on the test stream"), "testing"))  # the owner's chat is the default's
     assert captured == []
+
+
+def test_a_chat_whose_entry_names_the_default_profile_is_the_default_profiles(env):
+    """``"profile": "default"`` is the default profile, as in ``extra.profiles``: read, answered, routed to."""
+    mod, _, chats = env
+    data = json.loads(chats.read_text())
+    data["OWNERDM"]["profile"] = "default"
+    chats.write_text(json.dumps(data))
+    adapter, captured = make_adapter(mod)
+    assert adapter._listened_profiles() == [] and mod._pargs("OWNERDM") == []
+    run(adapter._handle_event(dm("OWNERDM", "hello")))
+    assert [e.text for e in captured] == ["hello"]
+    assert adapter._owner_dm() == "OWNERDM"
+
+
+def test_an_events_gap_is_one_warning_with_the_range_and_the_cursor_moves_past_it(env, caplog):
+    """The daemon's journal lost 11-60 (a crash, a trim): ``listen --since 10`` says so with an ``events.gap`` whose seq
+    is the cursor itself. One warning names the range and the count (no message text), the next event is a turn."""
+    mod, tmp, _ = env
+    gap = {"seq": 10, "id": "events.gap:10:61", "type": "events.gap", "at": 1790000000000, "from": 11, "to": 60}
+    owner = dm("OWNERDM", "still there?") | {"seq": 61}
+    (tmp / "events.jsonl").write_text(json.dumps(gap) + "\n" + json.dumps(owner) + "\n")
+    adapter, captured = make_adapter(mod)
+    adapter._write_cursor(10)
+    with caplog.at_level(logging.INFO):
+        _one_listen_round(adapter, captured)
+    listen = next(c for c in calls(tmp) if c[0] == "listen")
+    assert listen[listen.index("--since") + 1] == "10"
+    gaps = [r for r in caplog.records if "events.gap" in r.getMessage()]
+    assert len(gaps) == 1 and gaps[0].levelno == logging.WARNING
+    assert "events 11-60 (50) were lost" in gaps[0].getMessage()
+    assert not any("still there?" in r.getMessage() for r in caplog.records)
+    assert [e.text for e in captured] == ["still there?"] and adapter._read_cursor() == 61
 
 
 def test_new_chats_of_a_second_profile_are_discovered_there_and_remember_it(env):
@@ -768,3 +1193,91 @@ def test_names_in_the_prompts_come_from_the_config_with_neutral_defaults(env):
     assert plain.owner_keys_file == plain.state_dir / "owner_keys.txt"
     named = mod.GhostlyAdapter(PlatformConfig(enabled=True, extra={"owner_name": "Ana", "agent_name": "Hermes (lab)"}))
     assert "NOT Ana" in named.role_notes["contact"] and "You are Hermes (lab)." in named.role_notes["agent_peer"]
+
+
+def test_ghostly_bin_with_a_tilde_or_a_bare_name_is_found(env, tmp_path, monkeypatch):
+    mod, _, _ = env
+    # python-dotenv leaves ``~`` as is, so ~/.hermes/.env hands the plugin the literal value.
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.setenv("GHOSTLY_BIN", "~/ghostly")
+    assert mod._ghostly_bin() == str(tmp_path / "ghostly")
+    assert mod.check_requirements()
+    # A wrapper's bare name is looked up on PATH.
+    monkeypatch.setenv("PATH", os.pathsep.join([str(tmp_path), os.environ.get("PATH", "")]))
+    monkeypatch.setenv("GHOSTLY_BIN", "ghostly")
+    assert mod._ghostly_bin() == str(tmp_path / "ghostly")
+    monkeypatch.setenv("GHOSTLY_BIN", "~/missing-ghostly")
+    assert mod._ghostly_bin() is None
+
+
+def test_missing_ghostly_bin_names_the_value_tried(env, monkeypatch, caplog):
+    mod, _, _ = env
+    monkeypatch.setenv("GHOSTLY_BIN", "~/missing-ghostly")
+    adapter, _ = make_adapter(mod)
+    with caplog.at_level("WARNING"):
+        assert run(adapter.connect()) is False
+    assert "GHOSTLY_BIN=~/missing-ghostly" in caplog.text
+
+
+def test_malformed_allowlist_entries_are_dropped_and_the_rest_keeps_working(env, caplog):
+    mod, tmp, chats = env
+    chats.write_text(json.dumps({
+        "OWNERDM": {"label": "owner", "name": "Ana", "role": "owner"},
+        "BADDM": "owner",                                                          # a bare role, not an object
+        "group:G1": {"label": "dev", "role": "group", "mentions_only": True,
+                     "members": {"OWNERKEY": {"name": "Ana", "owner": True}, "BOTKEY": "Peer"}},  # a bare name
+        "group:G3": {"label": "ops", "role": "group", "members": ["OWNERKEY"]},    # a list, not an object
+    }))
+    with caplog.at_level("ERROR"):
+        adapter, captured = make_adapter(mod)
+    read_group(adapter, grp("G1", "OWNERKEY", "owner talking"), grp("G1", "BOTKEY", "@Hermes hi", mentioned=True),
+               grp("G3", "OWNERKEY", "@Hermes ops", mentioned=True), grp("G2", "OWNERKEY", "new group"))
+    run(adapter._handle_event(dm("BADDM", "hi")))                               # unresolvable now: ignored, no error
+    run(adapter._handle_event(dm("OWNERDM", "hi")))
+    assert [e.text.split("] ", 1)[-1] for e in captured] == ["owner talking", "@Hermes hi", "@Hermes ops", "new group", "hi"]
+    assert json.loads(chats.read_text())["group:G2"]["members"]["OWNERKEY"].get("owner") is True
+    # Saving the new group leaves the owner's malformed entries in the file as written (only memory ignores them).
+    on_disk = json.loads(chats.read_text())
+    assert on_disk["BADDM"] == "owner" and on_disk["group:G1"]["members"]["BOTKEY"] == "Peer"
+    assert on_disk["group:G3"]["members"] == ["OWNERKEY"]
+    assert "BADDM" not in adapter.config.extra["allow_from"]
+    # One error line per dropped entry, naming it.
+    errors = [r.getMessage() for r in caplog.records if r.name == mod.logger.name and r.levelname == "ERROR"]
+    assert len(errors) == 3
+    assert any("BADDM" in e for e in errors) and any("BOTKEY" in e for e in errors) and any("group:G3" in e for e in errors)
+
+
+
+def test_one_line_group_replies_that_start_with_an_emoji_are_not_taken_for_tool_progress(env):
+    """Only the gateway's progress shapes are dropped in a group (a progress verb, or a tool name then ``:`` / ``...``);
+    a short reply that happens to start with one of the tool emoji goes out."""
+    mod, tmp, _ = env
+    adapter, _ = make_adapter(mod)
+    for reply in ("❓ Which branch?", "🔍 Looking into it", "💡 We could ship it on Friday", "🧪 tests green on One",
+                  "📝 Notes from the call:\n- the relay is back"):
+        assert run(adapter.send("group:G1", reply)).success
+    assert sum(c[:2] == ["group", "send"] for c in calls(tmp)) == 5
+    for feed in ("📝 skill_manage...", '⚙️ process_manage: "list"', '🌐 browser_exec: "open the page"',
+                 "👁️ Looking at the image", "🐍 Running code", "🔍 Searching the web for relay status"):
+        assert mod._is_tool_progress(feed), feed
+
+
+def test_a_hermes_without_the_catalog_cache_still_keeps_notices_out(env, monkeypatch):
+    """``agent.i18n._catalog_cache`` is private: if a Hermes update renames it, the check falls back to loading the
+    catalogs (slow once) instead of seeing no notice at all and letting every one into groups."""
+    mod, tmp, _ = env
+    from agent import i18n
+    from agent.i18n import t
+    import types
+
+    class WithoutCache(types.ModuleType):          # agent.i18n as the adapter imports it, minus the private cache
+        def __getattr__(self, name):
+            if name == "_catalog_cache":
+                raise AttributeError(name)
+            return getattr(i18n, name)
+
+    monkeypatch.setitem(sys.modules, "agent.i18n", WithoutCache("agent.i18n"))
+    adapter, _ = make_adapter(mod, inbound=False)
+    assert mod._gateway_notice_kind(t("gateway.errors.unexpected_silence", lang="de")) == "silence"
+    assert run(adapter.send("group:G1", t("gateway.errors.unexpected_silence", lang="de"))).success
+    assert not [c for c in calls(tmp) if "G1" in c]
