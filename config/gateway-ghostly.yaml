@@ -17,6 +17,7 @@ platforms:
       # chats_file: ~/.hermes/ghostly-platform/chats.json          (the default)
       # owner_keys_file: ~/.hermes/ghostly-platform/owner_keys.txt (the default)
       # profiles: []                 # more Ghostly profiles to listen to
+      # media_max_age_days: 7        # received files kept this long in ghostly-platform/media (0: keep all)
 
 # Recommended display settings for a chat app: the text between tool calls goes out as it is written,
 # the progress bubble is edited in place, and Markdown is stripped (Ghostly shows it as raw symbols).

@@ -17,7 +17,8 @@ agents: bot loop guard, no gateway control); ``contact`` (unclassified DM, reply
 the file are added on their first message as ``contact`` (DM) or ``group``, with ``"auto": true``.
 
 Other settings in ``platforms.ghostly.extra``: ``owner_name`` (how the prompts name the owner, default "the owner"),
-``agent_name`` (how they name this agent, default "Hermes"), ``owner_keys_file``, ``profiles``. Environment:
+``agent_name`` (how they name this agent, default "Hermes"), ``owner_keys_file``, ``profiles``, ``media_max_age_days``
+(received files are deleted after this many days, default 7, 0 keeps them). Environment:
 GHOSTLY_HOME_CHANNEL (cron target), optional GHOSTLY_BIN.
 
 The owner in a group: a member marked ``"owner": true``, or a key listed in ``extra.owner_keys_file`` (default
@@ -57,6 +58,8 @@ logger = logging.getLogger(__name__)
 MAX_MESSAGE_LENGTH = 3500
 SEND_TIMEOUT_SECONDS = 90
 FILE_SAVE_TIMEOUT_SECONDS = 180
+MEDIA_MAX_AGE_DAYS = 7.0
+MEDIA_PRUNE_INTERVAL_SECONDS = 6 * 3600
 # Received files saved at once (each is a CLI process); the other chats' messages never wait for them.
 FILE_SAVES_AT_ONCE = 3
 TYPING_REFRESH_SECONDS = 5.0
@@ -456,6 +459,17 @@ def _truthy(value: Any) -> bool:
     return str(value).strip().lower() in {"1", "true", "yes", "on"}
 
 
+def _max_age_days(value: Any) -> float:
+    """``extra.media_max_age_days``: unset or unreadable means the default, 0 or less keeps everything."""
+    if value is None or str(value).strip() == "":
+        return MEDIA_MAX_AGE_DAYS
+    try:
+        return max(float(value), 0.0)
+    except (TypeError, ValueError):
+        logger.warning("[ghostly] media_max_age_days %r is not a number; using %g", value, MEDIA_MAX_AGE_DAYS)
+        return MEDIA_MAX_AGE_DAYS
+
+
 def _slug(text: str) -> str:
     s = "".join(c.lower() if c.isalnum() else "-" for c in text).strip("-")
     while "--" in s:
@@ -616,6 +630,9 @@ class GhostlyAdapter(BasePlatformAdapter):
         self.state_dir = self.chats_file.parent
         self.cursor_file = self.state_dir / "cursor"
         self.media_dir = self.state_dir / "media"
+        # Received files older than this go away (0 keeps everything); pruned at connect and on a save.
+        self.media_max_age_days = _max_age_days(extra.get("media_max_age_days"))
+        self._media_pruned_at = 0.0
         self.chats: Dict[str, dict] = {}
         self._chats_mtime = 0.0
         self._chats_on_disk: Dict[str, Any] = {}   # chats.json as last read, malformed entries included
@@ -790,6 +807,7 @@ class GhostlyAdapter(BasePlatformAdapter):
             logger.warning("[ghostly] ghostly CLI not found (tried %s); delivery disabled", tried)
             return False
         self._load_chats()
+        self._prune_media()
         _start_notice_warmup(connecting=True)
         self._mark_connected()
         if self.inbound:
@@ -1265,7 +1283,30 @@ class GhostlyAdapter(BasePlatformAdapter):
             # Out of the count before the next react is queued (the done callback runs a loop step later).
             self._seen_tasks.discard(asyncio.current_task())
 
+    def _prune_media(self) -> None:
+        """Delete received files older than ``media_max_age_days``; the gateway's own media sweep skips this folder."""
+        self._media_pruned_at = time.time()
+        if self.media_max_age_days <= 0:
+            return
+        cutoff = self._media_pruned_at - self.media_max_age_days * 86400
+        removed = 0
+        try:
+            entries = list(self.media_dir.iterdir())
+        except OSError:  # no folder yet, or a file / unreadable folder in its place: never fail a connect or a save
+            return
+        for path in entries:
+            try:
+                if path.is_file() and path.stat().st_mtime < cutoff:
+                    path.unlink()
+                    removed += 1
+            except OSError as exc:
+                logger.warning("[ghostly] could not prune %s: %s", path.name, exc)
+        if removed:
+            logger.info("[ghostly] pruned %d received file(s) older than %g days", removed, self.media_max_age_days)
+
     async def _save_file(self, f: dict, chat_id: str = "") -> Optional[str]:
+        if time.time() - self._media_pruned_at >= MEDIA_PRUNE_INTERVAL_SECONDS:
+            self._prune_media()
         self.media_dir.mkdir(parents=True, exist_ok=True)
         name = os.path.basename(str(f.get("name") or "file")) or "file"
         path = self.media_dir / f"{int(time.time())}-{str(f['id'])[:12]}-{name}"
