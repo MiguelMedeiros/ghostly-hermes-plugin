@@ -431,6 +431,45 @@ def test_first_listen_starts_at_the_current_seq_and_advances_the_cursor(env):
     assert adapter._read_cursor() == 42 and captured[0].text == "new"
 
 
+def test_a_file_being_saved_holds_only_its_own_chat(env):
+    """A received file can take minutes to save: the other chats' messages go on meanwhile, the same chat's next
+    messages keep their order behind it, and the cursor stays before the file until it is saved."""
+    mod, tmp, _ = env
+    fake = tmp / "ghostly"                         # `file save` waits until the test creates <tmp>/release
+    fake.write_text(fake.read_text().replace(
+        '"file save") shift 2;', '"file save") while [ ! -e "$dir/release" ]; do sleep 0.05; done; shift 2;'))
+    events = [dm("PEERDM", "", file={"id": "F1", "name": "big.bin"}) | {"seq": 60},
+              dm("PEERDM", "did it arrive?") | {"seq": 61},
+              dm("OWNERDM", "are you there?") | {"seq": 62}]
+    (tmp / "events.jsonl").write_text("".join(json.dumps(e) + "\n" for e in events))
+    adapter, captured = make_adapter(mod)
+    adapter._running = True
+
+    async def until(done):
+        for _ in range(100):
+            await asyncio.sleep(0.05)
+            if done():
+                break
+
+    async def scenario():
+        task = asyncio.create_task(adapter._listen_loop())
+        await until(lambda: captured)
+        while_saving = ([e.source.chat_id for e in captured], adapter._read_cursor())
+        (tmp / "release").write_text("")
+        await until(lambda: len(captured) == 3)
+        await asyncio.sleep(0.05)
+        adapter._running = False
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        return while_saving
+
+    assert run(scenario()) == (["OWNERDM"], 59)
+    assert [(e.source.chat_id, bool(e.media_urls), e.text) for e in captured[1:]] == [
+        ("PEERDM", True, ""), ("PEERDM", False, "did it arrive?")]
+    assert adapter._read_cursor() == 62
+
+
 def test_gateway_notices_never_reach_a_ghostly_chat_and_the_owner_gets_a_short_line(env):
     """The gateway's silence warning (the one the gateway really produces, in any catalog language) and its other
     error notices stay in the log: groups and peers get nothing, the owner's DM gets "👀 seen" / a short error line."""
