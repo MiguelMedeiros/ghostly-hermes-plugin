@@ -32,6 +32,7 @@ listened to as well (``ghostly -p <name>``), with its own cursor; the chat is re
 """
 
 import asyncio
+import collections
 import contextlib
 import json
 import logging
@@ -41,7 +42,7 @@ import shutil
 import time
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 from gateway.config import Platform, PlatformConfig
 from gateway.platforms._shared import get_scoped_secret as _get_scoped_secret, send_error
@@ -54,10 +55,17 @@ logger = logging.getLogger(__name__)
 MAX_MESSAGE_LENGTH = 3500
 SEND_TIMEOUT_SECONDS = 90
 FILE_SAVE_TIMEOUT_SECONDS = 180
+# Received files saved at once (each is a CLI process); the other chats' messages never wait for them.
+FILE_SAVES_AT_ONCE = 3
 TYPING_REFRESH_SECONDS = 5.0
 # React at once to each owner message that is read (their DM, all they write in a group), so they see it landed.
 SEEN_EMOJI = "👀"
-RETRY_INITIAL, RETRY_MAX = 2.0, 60.0
+# Each 👀 is a `ghostly` CLI process (~70 MB): at most this many run at once, and at most SEEN_REACTS_QUEUED more wait.
+# A burst beyond that (a catch-up after a restart or a reconnect) skips the oldest waiting ones: the newest still get it.
+SEEN_REACTS_AT_ONCE = 2
+SEEN_REACTS_QUEUED = 16
+# While the daemon is down each failed listen is one cheap CLI spawn; a low cap reads the first message after it is back soon.
+RETRY_INITIAL, RETRY_MAX = 2.0, 15.0
 SECRET_GUARD_EXIT = 5
 _FALLBACK_BIN = os.path.expanduser("~/.local/bin/ghostly")
 GROUP_PREFIX = "group:"
@@ -67,6 +75,12 @@ DEFAULT_OWNER_NAME = "the owner"
 DEFAULT_AGENT_NAME = "Hermes"
 # chat id -> the Ghostly profile it lives in, for chats outside the default profile (published from the allowlist).
 _CHAT_PROFILE: Dict[str, str] = {}
+
+
+def _entry_profile(entry: Any) -> Optional[str]:
+    """The non-default Ghostly profile an allowlist entry names; None for the default one (unset or "default")."""
+    profile = str(entry.get("profile") or "") if isinstance(entry, dict) else ""
+    return profile if profile and profile != "default" else None
 
 
 def _pargs(chat: str) -> List[str]:
@@ -131,21 +145,50 @@ OWNER_ERROR_REPLY = "⚠️ Something failed on my side; the details are in the 
 _SILENCE_KEY = "gateway.errors.unexpected_silence"
 
 
-def _gateway_notice_prefixes() -> Dict[str, str]:
-    """{text prefix: kind} for the gateway's own notices, in every catalog language: the silence-marker warning
-    ("silence") and the other ``gateway.errors.*`` / failed-turn texts ("error"). Read from the catalogs at call time
-    (a module constant would go stale on the next Hermes update, as ``_UNEXPECTED_SILENCE_REPLY`` did)."""
-    out: Dict[str, str] = {}
+def _notice_catalogs() -> Tuple[Dict[str, str], ...]:
+    """The catalogs of every language, as ``agent.i18n`` hands them out now."""
     try:
         from agent.i18n import _load_catalog, supported_languages
         langs = supported_languages()
     except Exception:
-        return out
+        return ()
+    out = []
     for lang in langs:
         try:
-            catalog = _load_catalog(lang)
+            out.append(_load_catalog(lang))
         except Exception:
             continue
+    return tuple(out)
+
+
+# (catalogs, {prefix: kind}, the prefixes as a tuple for str.startswith). agent.i18n caches each catalog per
+# (home, lang) until reset_language_cache, so the same objects mean the same texts and the map is rebuilt only when it
+# hands out others (a pack, overlay or language change, another profile home). Holding them keeps their ids unique.
+_notice_cache: Tuple[Tuple[Dict[str, str], ...], Dict[str, str], Tuple[str, ...]] = ((), {}, ())
+
+
+def _notice_lookup() -> Tuple[Dict[str, str], Tuple[str, ...]]:
+    global _notice_cache
+    catalogs = _notice_catalogs()
+    cached, prefixes, starts = _notice_cache
+    if not (catalogs and len(cached) == len(catalogs) and all(a is b for a, b in zip(cached, catalogs))):
+        prefixes = _build_notice_prefixes(catalogs)
+        starts = tuple(prefixes)
+        _notice_cache = (catalogs, prefixes, starts)
+    return prefixes, starts
+
+
+def _gateway_notice_prefixes() -> Dict[str, str]:
+    """{text prefix: kind} for the gateway's own notices, in every catalog language: the silence-marker warning
+    ("silence") and the other ``gateway.errors.*`` / failed-turn texts ("error"). Read from the catalogs Hermes has
+    loaded (a module constant would go stale on the next Hermes update, as ``_UNEXPECTED_SILENCE_REPLY`` did), and
+    built again only when those change. The dict is shared: do not modify it."""
+    return _notice_lookup()[0]
+
+
+def _build_notice_prefixes(catalogs: Tuple[Dict[str, str], ...]) -> Dict[str, str]:
+    out: Dict[str, str] = {}
+    for catalog in catalogs:
         for key, text in catalog.items():
             if not key.startswith("gateway.errors.") or not isinstance(text, str):
                 continue
@@ -182,7 +225,10 @@ def _gateway_notice_kind(content: str) -> Optional[str]:
         text = text.split("\n\n", 1)[1].strip()
     if text.startswith(_LIFECYCLE_PREFIXES):
         return "status"
-    for prefix, kind in _gateway_notice_prefixes().items():
+    prefixes, starts = _notice_lookup()
+    if not text.startswith(starts):
+        return None
+    for prefix, kind in prefixes.items():
         if text.startswith(prefix):
             return kind
     return None
@@ -215,6 +261,18 @@ def _reply_expected(is_group: bool, role: str, msg: Dict[str, Any]) -> Optional[
         reply_to = msg.get("replyTo") if isinstance(msg.get("replyTo"), dict) else {}
         return bool(msg.get("mentioned") or reply_to.get("from") == "me")
     return False if role in PEER_ROLES else None
+
+
+def _event_chat(event: dict) -> str:
+    """The chat a message event belongs to ("" for presses and other events)."""
+    if event.get("type") == "group.message":
+        return f"{GROUP_PREFIX}{event['group']}" if event.get("group") else ""
+    return str(event.get("chat") or "") if event.get("type") == "message.received" else ""
+
+
+def _has_file(event: dict) -> bool:
+    f = (event.get("message") or {}).get("file")
+    return isinstance(f, dict) and bool(f.get("id"))
 
 
 def _ghostly_bin() -> Optional[str]:
@@ -289,6 +347,15 @@ async def _cli(args: List[str], stdin: Optional[str] = None, timeout: float = SE
         except ValueError:
             payload = {}
     return proc.returncode, payload if isinstance(payload, dict) else {}, err.decode("utf-8", "replace")
+
+
+async def _last_line(stream: asyncio.StreamReader, keep: int = 4096) -> str:
+    """The last non-empty line of ``stream`` (a CLI's stderr), read to EOF holding only its tail, cut to 300 chars."""
+    tail = b""
+    while chunk := await stream.read(keep):
+        tail = (tail + chunk)[-keep:]
+    lines = tail.decode("utf-8", "replace").strip().splitlines()
+    return lines[-1].strip()[:300] if lines else ""
 
 
 def _cli_error(args: List[str], code: int, payload: dict, err: str) -> Optional[str]:
@@ -370,6 +437,19 @@ async def _standalone_send(
     return await _deliver(chat_id, message, media_files)
 
 
+def _log_gap(event: Dict[str, Any], profile: Optional[str] = None) -> None:
+    """``events.gap``: the daemon's journal no longer holds ``from``..``to`` (a crash, a trim), so ``--since`` could
+    not replay them. One warning with the range and the count, never message text; the cursor moves past it."""
+    first, last = event.get("from"), event.get("to")
+    where = f" ({profile})" if profile else ""
+    if isinstance(first, int) and isinstance(last, int) and last >= first:
+        logger.warning("[ghostly] events %d-%d (%d) were lost by the daemon%s (events.gap): messages in that range "
+                       "never reached the gateway", first, last, last - first + 1, where)
+    else:
+        logger.warning("[ghostly] events were lost by the daemon%s (events.gap, range unknown): messages in it "
+                       "never reached the gateway", where)
+
+
 class GhostlyAdapter(BasePlatformAdapter):
     """Ghostly chats as gateway sessions; outbound always, inbound when ``extra.inbound`` is on."""
 
@@ -402,7 +482,9 @@ class GhostlyAdapter(BasePlatformAdapter):
         self._profile_procs: Dict[str, asyncio.subprocess.Process] = {}
         self._dedup = MessageDeduplicator(max_size=4000, ttl_seconds=3600)
         self._typing_at: Dict[str, float] = {}
-        self._seen_tasks: set = set()
+        self._seen_tasks: set = set()       # the workers that run the 👀 reacts (at most SEEN_REACTS_AT_ONCE)
+        self._seen_pending: collections.deque = collections.deque()   # CLI args of the reacts waiting, oldest first
+        self._seen_skipped = 0
         # (chat id, question message id) -> session key of an exec approval waiting on its buttons.
         self._approvals: Dict[tuple, str] = {}
         # Approvals asked in a colleague's DM and shown in the owner's instead (oldest first):
@@ -410,6 +492,12 @@ class GhostlyAdapter(BasePlatformAdapter):
         self._routed: List[Dict[str, str]] = []
         # (chat id, status kind) -> the message a lifecycle status went out as, so the next one edits it.
         self._status_ids: Dict[tuple, str] = {}
+        # (profile, chat id) -> the last event queued behind a received file of that chat (kept in order, off the stream).
+        self._lanes: Dict[tuple, asyncio.Task] = {}
+        # profile -> seqs still in a lane (the cursor stays before the oldest) / the last seq read from the stream.
+        self._held: Dict[Optional[str], set] = {}
+        self._last_seq: Dict[Optional[str], int] = {}
+        self._file_saves = asyncio.Semaphore(FILE_SAVES_AT_ONCE)
 
     # ---- allowlist -------------------------------------------------------------------------------
 
@@ -448,17 +536,29 @@ class GhostlyAdapter(BasePlatformAdapter):
         except ValueError as exc:
             logger.error("[ghostly] %s is not valid JSON (%s); keeping the previous allowlist", self.chats_file, exc)
             return
-        self.chats, self._chats_mtime = (data if isinstance(data, dict) else {}), mtime
+        if not isinstance(data, dict):
+            logger.error("[ghostly] %s is not a JSON object of chats; keeping the previous allowlist", self.chats_file)
+            return
+        self.chats, self._chats_mtime = data, mtime
         self._publish_allowlist()
 
     def _save_chats(self) -> None:
+        self._publish_allowlist()
+        try:
+            on_disk = self.chats_file.stat().st_mtime
+        except FileNotFoundError:
+            on_disk = 0.0
+        if on_disk != self._chats_mtime:
+            # The file changed since it was last read (an edit in progress, not valid yet): never write over it. A chat
+            # added meanwhile is allowed from memory, and its first message once the file reads again writes it there.
+            logger.warning("[ghostly] %s changed since it was last read; not writing over it", self.chats_file)
+            return
         self.state_dir.mkdir(parents=True, exist_ok=True)
         tmp = self.chats_file.with_suffix(".tmp")
         tmp.write_text(json.dumps(self.chats, ensure_ascii=False, indent=2))
         os.chmod(tmp, 0o600)
         tmp.replace(self.chats_file)
         self._chats_mtime = self.chats_file.stat().st_mtime
-        self._publish_allowlist()
 
     def _publish_allowlist(self) -> None:
         """Gateway authorization reads ``extra.allow_from`` (DM user ids) and ``extra.group_allowed_chats``
@@ -466,8 +566,7 @@ class GhostlyAdapter(BasePlatformAdapter):
         self.config.extra["allow_from"] = [cid for cid in self.chats if not cid.startswith(GROUP_PREFIX)]
         self.config.extra["group_allowed_chats"] = [cid for cid in self.chats if cid.startswith(GROUP_PREFIX)]
         _CHAT_PROFILE.clear()
-        _CHAT_PROFILE.update({cid: str(c["profile"]) for cid, c in self.chats.items()
-                              if isinstance(c, dict) and c.get("profile") and c.get("profile") != "default"})
+        _CHAT_PROFILE.update({cid: _entry_profile(c) for cid, c in self.chats.items() if _entry_profile(c)})
 
     def _listened_profiles(self) -> List[str]:
         """The extra profiles to listen to: those in ``extra.profiles`` and those an allowlisted chat lives in."""
@@ -555,7 +654,7 @@ class GhostlyAdapter(BasePlatformAdapter):
                 with contextlib.suppress(ProcessLookupError):
                     proc.kill()
         await cancel_task(self._listen_task)
-        for task in self._profile_tasks:
+        for task in [*self._profile_tasks, *self._lanes.values()]:
             await cancel_task(task)
         self._listen_task, self._profile_tasks = None, []
         self._mark_disconnected()
@@ -576,6 +675,25 @@ class GhostlyAdapter(BasePlatformAdapter):
         tmp.write_text(str(seq))
         tmp.replace(path)
 
+    async def _status_seq(self, profile: Optional[str] = None) -> Optional[int]:
+        """The profile's current ``events.lastSeq`` from ``ghostly status``; None (and a warning) when it cannot tell,
+        e.g. "Profile default is in use" while the daemon starts, a timeout, or an answer without ``events``."""
+        code, status, err = await _cli((["-p", profile] if profile else []) + ["status"])
+        if code == 0:
+            try:
+                seq = int((status.get("events") or {})["lastSeq"])
+                if seq >= 0:
+                    return seq
+            except (KeyError, TypeError, ValueError):
+                pass
+            reason = "no events.lastSeq in its answer"
+        else:
+            detail = err.strip().splitlines()[-1] if err.strip() else str(status.get("error") or "")
+            reason = f"exit {code}" + (f": {detail[:200]}" if detail else "")
+        logger.warning("[ghostly] status%s could not give the current event seq (%s); not listening yet, retrying",
+                       f" ({profile})" if profile else "", reason)
+        return None
+
     async def _listen_loop(self, profile: Optional[str] = None) -> None:
         """One ``ghostly listen`` stream: the default profile's, or ``profile``'s (``-p``) with its own cursor."""
         delay = RETRY_INITIAL
@@ -583,17 +701,22 @@ class GhostlyAdapter(BasePlatformAdapter):
         while self._running:
             since = self._read_cursor(profile)
             if since is None:  # first start: from now, never replay the whole history
-                code, status, _ = await _cli(pargs + ["status"])
-                since = int(((status.get("events") or {}).get("lastSeq")) or 0) if code == 0 else 0
+                since = await self._status_seq(profile)
+                if since is None:  # no guessed cursor: wait for the daemon rather than replay the journal from 0
+                    await asyncio.sleep(min(delay + random.uniform(0, delay / 2), RETRY_MAX))
+                    delay = min(delay * 2, RETRY_MAX)
+                    continue
                 self._write_cursor(since, profile)
             binary = _ghostly_bin()
             started = time.monotonic()
+            reason = None
             try:
                 proc = await asyncio.create_subprocess_exec(
                     binary, *pargs, "listen", "--type", "message.received", "--type", "group.message",
-                    "--type", "button.pressed", "--since", str(since),
-                    stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.DEVNULL, env=_cli_env(binary),
+                    "--type", "group.mentioned", "--type", "button.pressed", "--since", str(since),
+                    stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE, env=_cli_env(binary),
                     limit=16 * 1024 * 1024)
+                reason = asyncio.create_task(_last_line(proc.stderr))  # drained as it comes: a full pipe would stall listen
                 if profile:
                     self._profile_procs[profile] = proc
                 else:
@@ -605,26 +728,77 @@ class GhostlyAdapter(BasePlatformAdapter):
                         event = json.loads(raw)
                     except ValueError:
                         continue
-                    try:
-                        await self._handle_event(event, profile)
-                    except Exception:  # one bad event must not kill the stream
-                        logger.exception("[ghostly] failed to handle event %s", event.get("seq"))
-                    if isinstance(event.get("seq"), int):
-                        self._write_cursor(event["seq"], profile)
+                    seq = event["seq"] if isinstance(event.get("seq"), int) else None
+                    lane = (profile, _event_chat(event))
+                    if lane[1] and (lane in self._lanes or _has_file(event)):
+                        # A file can take minutes to save: it and that chat's next events wait, the stream goes on.
+                        self._queue_in_lane(lane, event, seq)
+                    else:
+                        await self._handle_safely(event, profile)
+                    if seq is not None:
+                        self._last_seq[profile] = seq
+                        self._save_cursor(profile)
                 code = await proc.wait()
-                logger.warning("[ghostly] listen exited with %s", code)
+                await asyncio.wait({reason}, timeout=2)  # a child it left behind may still hold the pipe open
+                why = reason.result() if reason.done() else ""
+                logger.warning("[ghostly] listen exited with %s%s", code, f": {why}" if why else "")
             except asyncio.CancelledError:
                 raise
             except Exception:
                 logger.exception("[ghostly] listen stream failed")
+            finally:
+                if reason and not reason.done():
+                    reason.cancel()
             if time.monotonic() - started > 60:
                 delay = RETRY_INITIAL
-            await asyncio.sleep(delay + random.uniform(0, delay / 2))
+            await asyncio.sleep(min(delay + random.uniform(0, delay / 2), RETRY_MAX))
             delay = min(delay * 2, RETRY_MAX)
+
+    async def _handle_safely(self, event: dict, profile: Optional[str]) -> None:
+        try:
+            await self._handle_event(event, profile)
+        except Exception:  # one bad event must not kill the stream
+            logger.exception("[ghostly] failed to handle event %s", event.get("seq"))
+
+    def _queue_in_lane(self, lane: tuple, event: dict, seq: Optional[int]) -> None:
+        """Handle ``event`` after the chat's earlier queued ones, off the listen stream. Its seq holds the cursor
+        until it is handled, so a restart in the meantime reads it again instead of losing it."""
+        profile = lane[0]
+        before = self._lanes.get(lane)
+        held = self._held.setdefault(profile, set())
+        if seq is not None:
+            held.add(seq)
+
+        async def run() -> None:
+            if before is not None:
+                await asyncio.wait({before})
+            await self._handle_safely(event, profile)
+
+        task = asyncio.create_task(run())
+        self._lanes[lane] = task
+
+        def done(t: asyncio.Task) -> None:
+            if self._lanes.get(lane) is t:
+                del self._lanes[lane]
+            if seq is not None and not t.cancelled():
+                held.discard(seq)
+                self._save_cursor(profile)
+
+        task.add_done_callback(done)
+
+    def _save_cursor(self, profile: Optional[str]) -> None:
+        """The last seq read, or the one before the oldest event still waiting in a lane."""
+        held = self._held.get(profile)
+        seq = min(held) - 1 if held else self._last_seq.get(profile)
+        if seq is not None:
+            self._write_cursor(seq, profile)
 
     # ---- inbound ---------------------------------------------------------------------------------
 
     async def _handle_event(self, event: dict, profile: Optional[str] = None) -> None:
+        if event.get("type") == "events.gap":
+            _log_gap(event, profile)
+            return
         if event.get("type") == "button.pressed":
             chat_id = f"{GROUP_PREFIX}{event['group']}" if event.get("group") else str(event.get("chat") or "")
             await self._resolve_press(chat_id, str(event.get("messageId") or ""), str(event.get("button") or ""),
@@ -635,7 +809,9 @@ class GhostlyAdapter(BasePlatformAdapter):
             return
         if self._dedup.is_duplicate(str(event.get("id") or "")):
             return
-        is_group = event.get("type") == "group.message"
+        # group.mentioned (CLI 1.11): a mention learned after the message's group.message, which said none.
+        late_mention = event.get("type") == "group.mentioned"
+        is_group = late_mention or event.get("type") == "group.message"
         chat_id = f"{GROUP_PREFIX}{event.get('group')}" if is_group else str(event.get("chat") or "")
         if not chat_id or chat_id == GROUP_PREFIX + "None":
             return
@@ -649,10 +825,10 @@ class GhostlyAdapter(BasePlatformAdapter):
             return
         self._load_chats()
         chat = self.chats.get(chat_id)
-        if chat is not None and (chat.get("profile") or None) != profile:
+        if chat is not None and _entry_profile(chat) != profile:
             # The same id seen from another profile than the one its entry names: never answer through the wrong one.
             logger.info("[ghostly] ignoring %s: its entry is for profile %s, the event came from %s",
-                        chat_id[:12], chat.get("profile") or "default", profile or "default")
+                        chat_id[:12], _entry_profile(chat) or "default", profile or "default")
             return
         if chat is None:
             chat = await self._discover(chat_id, profile)
@@ -668,7 +844,12 @@ class GhostlyAdapter(BasePlatformAdapter):
         sender_is_owner = self._is_owner_member(chat, member) if is_group else role == "owner"
         # A delegate speaks for the owner outside the exceptions listed in the delegate note.
         sender_is_delegate = bool(who.get("delegate")) if is_group else bool(chat.get("delegate"))
-        if is_group and chat.get("mentions_only") and not (msg.get("mentioned") or sender_is_owner or sender_is_delegate):
+        gated = is_group and chat.get("mentions_only") and not (sender_is_owner or sender_is_delegate)
+        if late_mention and not gated:
+            return  # its group.message got through the gate and was the turn already
+        if gated and not msg.get("mentioned"):
+            logger.info("[ghostly] %s: no mention, skipping message %s from %s (mentions_only)",
+                        chat_id[:18], str(msg.get("id") or "?"), member[:8] or "?")
             return
         if is_group and not msg.get("mentioned") and self._answers_another_member(chat, msg):
             # The owner's tap or reply on another agent's message reaches every member: only that agent acts, no 👀 here.
@@ -777,7 +958,7 @@ class GhostlyAdapter(BasePlatformAdapter):
         """The owner's DM in the default profile: the home channel's entry when it is an owner chat, else the first."""
         self._load_chats()
         owners = [cid for cid, c in self.chats.items() if isinstance(c, dict) and not cid.startswith(GROUP_PREFIX)
-                  and c.get("role") == "owner" and not c.get("profile")]
+                  and c.get("role") == "owner" and not _entry_profile(c)]
         home = _home_chat()
         for cid in owners:
             if home and home in (cid, self.chats[cid].get("label")):
@@ -889,28 +1070,48 @@ class GhostlyAdapter(BasePlatformAdapter):
         return SendResult(success=True)
 
     def _react_seen(self, chat_id: str, message_id: str) -> None:
-        """Fire-and-forget: the turn must not wait on the reaction, and a failed one only gets logged."""
+        """Fire-and-forget: the turn must not wait on the reaction, and a failed one only gets logged.
+
+        The reacts wait in a short queue run by at most SEEN_REACTS_AT_ONCE workers, so a burst of owner messages never
+        starts a CLI process per message at once; past SEEN_REACTS_QUEUED waiting, the oldest one is skipped."""
         if chat_id.startswith(GROUP_PREFIX):
             args = _pargs(chat_id) + ["group", "react", chat_id[len(GROUP_PREFIX):], message_id, SEEN_EMOJI]
         else:
             args = _pargs(chat_id) + ["react", chat_id, message_id, SEEN_EMOJI]
+        while self._seen_pending and len(self._seen_pending) >= SEEN_REACTS_QUEUED:
+            self._seen_pending.popleft()
+            self._seen_skipped += 1
+        self._seen_pending.append(args)
+        if len(self._seen_tasks) < SEEN_REACTS_AT_ONCE:
+            task = asyncio.create_task(self._react_worker())
+            self._seen_tasks.add(task)
+            task.add_done_callback(self._seen_tasks.discard)
 
-        async def react() -> None:
-            code, payload, err = await _cli(args, timeout=30)
-            error = _cli_error(args, code, payload, err)
-            if error:
-                logger.warning("[ghostly] seen reaction: %s", error)
-
-        task = asyncio.create_task(react())
-        self._seen_tasks.add(task)
-        task.add_done_callback(self._seen_tasks.discard)
+    async def _react_worker(self) -> None:
+        try:
+            while self._seen_pending:
+                args = self._seen_pending.popleft()
+                try:
+                    code, payload, err = await _cli(args, timeout=30)
+                    error = _cli_error(args, code, payload, err)
+                except Exception as exc:  # best effort: one bad react must not strand the ones queued behind it
+                    error = repr(exc)
+                if error:
+                    logger.warning("[ghostly] seen reaction: %s", error)
+            if self._seen_skipped:
+                logger.info("[ghostly] skipped the seen reaction on %d older messages of a burst", self._seen_skipped)
+                self._seen_skipped = 0
+        finally:
+            # Out of the count before the next react is queued (the done callback runs a loop step later).
+            self._seen_tasks.discard(asyncio.current_task())
 
     async def _save_file(self, f: dict, chat_id: str = "") -> Optional[str]:
         self.media_dir.mkdir(parents=True, exist_ok=True)
         name = os.path.basename(str(f.get("name") or "file")) or "file"
         path = self.media_dir / f"{int(time.time())}-{str(f['id'])[:12]}-{name}"
         args = _pargs(chat_id) + ["file", "save", str(f["id"]), "--path", str(path), "--wait", "--timeout", str(FILE_SAVE_TIMEOUT_SECONDS - 10)]
-        code, payload, err = await _cli(args, timeout=FILE_SAVE_TIMEOUT_SECONDS)
+        async with self._file_saves:
+            code, payload, err = await _cli(args, timeout=FILE_SAVE_TIMEOUT_SECONDS)
         if _cli_error(args, code, payload, err) or not path.exists():
             logger.warning("[ghostly] could not save file %s: %s", f.get("id"), _cli_error(args, code, payload, err))
             return None
