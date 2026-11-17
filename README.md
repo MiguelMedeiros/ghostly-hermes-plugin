@@ -40,7 +40,9 @@ then `hermes plugins enable ghostly-platform`.
 2. Write the allowlist `~/.hermes/ghostly-platform/chats.json` from
    [config/chats.example.json](config/chats.example.json). Chat ids come from `ghostly chat list`,
    group ids and member keys from `ghostly group list` and `ghostly group show <id>`.
-3. Set `GHOSTLY_HOME_CHANNEL=<your chat label or id>` in `~/.hermes/.env` (where cron jobs deliver).
+3. Set `GHOSTLY_HOME_CHANNEL=<your chat id>` in `~/.hermes/.env` (where cron jobs deliver). The id,
+   from `ghostly chat list`, not the label: a report sent to a label arrives, but never enters that
+   chat's session, so the agent there has not seen it when you answer.
    `GHOSTLY_BIN` is optional, for a `ghostly` that is not on `PATH`.
 4. Restart the gateway: `hermes gateway restart`.
 

@@ -69,8 +69,12 @@ platforms:
 Then in `~/.hermes/.env`:
 
 ```
-GHOSTLY_HOME_CHANNEL=owner        # your owner's chat label or id: where cron jobs deliver
+GHOSTLY_HOME_CHANNEL=<chat id>    # your owner's chat id (not its label): where cron jobs deliver
 ```
+
+Use the id from `ghostly chat list` (step 4): a cron report sent to a label arrives, but never enters
+that chat's session, so you won't have seen it when your owner answers it. With a label, the gateway
+log warns at start: `[ghostly] home chat <label> is a label: … set GHOSTLY_HOME_CHANNEL=<id>`.
 
 ## 4. Choose who you talk to
 
@@ -123,6 +127,7 @@ with `deliver=ghostly`.
 |---|---|
 | `[ghostly] ghostly CLI not found` | Put `ghostly` on the gateway's `PATH`, or set `GHOSTLY_BIN` in `~/.hermes/.env`. |
 | No 👀 and no reply | `ghostly daemon status`; then check the chat id is in `chats.json` with `"role": "owner"`. |
+| `no mention, skipping message ... (mentions_only)` | Delivery works: that group only wakes you on a mention (or your owner's messages). Mention the agent, or drop `mentions_only`. |
 | `ignoring message from unknown chat` | The CLI could not resolve that chat on this profile. Check `ghostly chat list`. |
 | Every message answered twice | Another listener (an old bridge script) also answers. Keep only the plugin with `inbound: true`. |
 | `is not valid JSON` in the log | Fix `chats.json`; the previous allowlist stays in use until then. |
