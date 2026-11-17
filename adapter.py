@@ -40,6 +40,7 @@ import os
 import random
 import re
 import shutil
+import threading
 import time
 from datetime import datetime, timezone
 from pathlib import Path
@@ -146,8 +147,56 @@ OWNER_ERROR_REPLY = "⚠️ Something failed on my side; the details are in the 
 _SILENCE_KEY = "gateway.errors.unexpected_silence"
 
 
+# Profile home -> the thread loading its catalogs. A home is listed once connect() warmed it; a send re-warms only those.
+_notice_warmups: Dict[str, threading.Thread] = {}
+_notice_warmups_lock = threading.Lock()
+
+
+def _warm_notice_catalogs(home: str) -> None:
+    """Load every catalog language of ``home`` into ``agent.i18n``'s cache. Parsing the 17 locale files takes seconds
+    with the pure-Python YAML parser, so this runs in its own thread, never on the gateway's loop."""
+    with contextlib.suppress(Exception):
+        from agent.i18n import _load_catalog, supported_languages
+        for lang in supported_languages(home):
+            with contextlib.suppress(Exception):
+                _load_catalog(lang, home)
+
+
+def _start_notice_warmup(home: Optional[str] = None, *, connecting: bool = False) -> None:
+    """Load the current home's catalogs in the background (one thread per home at a time). connect() starts it; a send
+    that finds a catalog missing (``reset_language_cache`` after a pack or language change) starts it again."""
+    try:
+        from agent.i18n import _current_home
+        home = home or _current_home()
+    except Exception:
+        return
+    with _notice_warmups_lock:
+        running = _notice_warmups.get(home)
+        if (running is None and not connecting) or (running is not None and running.is_alive()):
+            return
+        thread = threading.Thread(target=_warm_notice_catalogs, args=(home,), name="ghostly-notice-catalogs", daemon=True)
+        _notice_warmups[home] = thread
+        thread.start()
+
+
 def _notice_catalogs() -> Tuple[Dict[str, str], ...]:
-    """The catalogs of every language, as ``agent.i18n`` hands them out now."""
+    """The catalogs ``agent.i18n`` has loaded already, in language order. This runs on the gateway's loop, so it never
+    parses a locale file: the missing ones are loaded by :func:`_start_notice_warmup` and counted once they are in. A
+    notice's own language is always among them, since the gateway rendered it with ``t()``, which loads that catalog.
+    A Hermes whose ``agent.i18n`` has no such cache gets the old full load instead: slow once, never blind."""
+    try:
+        from agent.i18n import _catalog_cache, _current_home, supported_languages
+        home = _current_home()
+        cached = [_catalog_cache.get((home, lang)) for lang in supported_languages(home)]
+    except Exception:
+        return _load_notice_catalogs()
+    if None in cached:
+        _start_notice_warmup(home)
+    return tuple(c for c in cached if c is not None)
+
+
+def _load_notice_catalogs() -> Tuple[Dict[str, str], ...]:
+    """Every language's catalog through ``agent.i18n._load_catalog`` (parses what is not loaded yet)."""
     try:
         from agent.i18n import _load_catalog, supported_languages
         langs = supported_languages()
@@ -736,6 +785,7 @@ class GhostlyAdapter(BasePlatformAdapter):
             logger.warning("[ghostly] ghostly CLI not found (tried %s); delivery disabled", tried)
             return False
         self._load_chats()
+        _start_notice_warmup(connecting=True)
         self._mark_connected()
         if self.inbound:
             self._listen_task = asyncio.create_task(self._listen_loop())
