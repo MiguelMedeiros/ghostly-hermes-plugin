@@ -9,6 +9,7 @@ import json
 import os
 import stat
 import sys
+import time
 from pathlib import Path
 
 import pytest
@@ -342,6 +343,42 @@ def test_received_file_is_saved_and_typed(env):
     run(adapter._handle_event(dm("OWNERDM", "", file={"id": "F1", "name": "a.png", "mime": "image/png", "size": 5})))
     event = captured[0]
     assert event.message_type.value == "photo" and Path(event.media_urls[0]).read_text() == "data\n"
+
+
+def _media(adapter, name, age_days):
+    adapter.media_dir.mkdir(parents=True, exist_ok=True)
+    path = adapter.media_dir / name
+    path.write_text("x")
+    old = time.time() - age_days * 86400
+    os.utime(path, (old, old))
+    return path
+
+
+def test_received_files_older_than_the_bound_are_pruned_at_connect_and_on_save(env):
+    mod, _, _ = env
+    adapter, _ = make_adapter(mod, inbound=False)
+    stale, fresh = _media(adapter, "1-old-a.webm", 8), _media(adapter, "2-new-b.png", 1)
+    assert run(adapter.connect()) is True
+    assert not stale.exists() and fresh.exists()
+    # On a save, at most once every few hours.
+    stale = _media(adapter, "3-old-c.webm", 8)
+    run(adapter._save_file({"id": "F2", "name": "d.png"}, "OWNERDM"))
+    assert stale.exists()
+    adapter._media_pruned_at -= mod.MEDIA_PRUNE_INTERVAL_SECONDS
+    run(adapter._save_file({"id": "F3", "name": "e.png"}, "OWNERDM"))
+    assert not stale.exists() and fresh.exists() and len(list(adapter.media_dir.iterdir())) == 3
+
+
+def test_media_max_age_days_sets_the_bound_and_zero_keeps_everything(env):
+    mod, _, _ = env
+    adapter, _ = make_adapter(mod, inbound=False, media_max_age_days=0)
+    ancient = _media(adapter, "1-old-a.webm", 400)
+    run(adapter.connect())
+    assert ancient.exists()
+    adapter, _ = make_adapter(mod, inbound=False, media_max_age_days=2)
+    week, day = _media(adapter, "2-old-b.webm", 3), _media(adapter, "3-new-c.webm", 1)
+    run(adapter.connect())
+    assert not ancient.exists() and not week.exists() and day.exists()
 
 
 def test_send_routes_dm_and_group_and_chunks_long_text(env):
