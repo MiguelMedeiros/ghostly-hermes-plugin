@@ -715,6 +715,28 @@ def test_gateway_notices_never_reach_a_ghostly_chat_and_the_owner_gets_a_short_l
     assert "a normal reply" in "".join(calls(tmp)[-1])
 
 
+def test_tool_progress_stays_out_of_groups_and_reaches_dms(env):
+    """The tool feed ("✍️ Writing …", "💻 Running …", a command block) is dropped in a group, sends and edits alike;
+    DMs keep it, and a group's short status lines (▶️ / ✅ / ⚠️ / 🔴) still go out."""
+    mod, tmp, _ = env
+    adapter, _ = make_adapter(mod)
+    feed = "📚 Reading skill \"ghostly-chat\"\n✍️ Writing ~/code/x.md\n💻 Running\n```\ngit status\n```"
+    assert run(adapter.send("group:G1", feed)).success
+    assert run(adapter.send("group:G1", "✍️ Writing NOTES.md")).success
+    assert run(adapter.edit_message("group:G1", "m9", feed + "\n🔍 Searching files")).success
+    assert calls(tmp) == []
+    for status in ("▶️ started on the release notes", "✅ PR merged", "⚠️ CI is red", "PR opened",
+                   "🔴 blocked: the Desktop CI"):
+        assert run(adapter.send("group:G1", status)).success
+    sent = ["".join(c) for c in calls(tmp)]
+    assert len(sent) == 5 and "blocked" in sent[-1]
+    log = tmp / "calls.log"
+    assert run(adapter.send("OWNERDM", feed)).success
+    assert log.read_text().count("Reading skill") == 1
+    assert run(adapter.send("PEERDM", feed)).success
+    assert log.read_text().count("Reading skill") == 2
+
+
 def _walk_every_catalog(mod, content):
     """The notice check as it was before the map was cached: every catalog walked on every call."""
     from agent.i18n import _load_catalog, supported_languages
@@ -1162,3 +1184,18 @@ def test_malformed_allowlist_entries_are_dropped_and_the_rest_keeps_working(env,
     errors = [r.getMessage() for r in caplog.records if r.name == mod.logger.name and r.levelname == "ERROR"]
     assert len(errors) == 3
     assert any("BADDM" in e for e in errors) and any("BOTKEY" in e for e in errors) and any("group:G3" in e for e in errors)
+
+
+
+def test_one_line_group_replies_that_start_with_an_emoji_are_not_taken_for_tool_progress(env):
+    """Only the gateway's progress shapes are dropped in a group (a progress verb, or a tool name then ``:`` / ``...``);
+    a short reply that happens to start with one of the tool emoji goes out."""
+    mod, tmp, _ = env
+    adapter, _ = make_adapter(mod)
+    for reply in ("❓ Which branch?", "🔍 Looking into it", "💡 We could ship it on Friday", "🧪 tests green on One",
+                  "📝 Notes from the call:\n- the relay is back"):
+        assert run(adapter.send("group:G1", reply)).success
+    assert sum(c[:2] == ["group", "send"] for c in calls(tmp)) == 5
+    for feed in ("📝 skill_manage...", '⚙️ process_manage: "list"', '🌐 browser_exec: "open the page"',
+                 "👁️ Looking at the image", "🐍 Running code", "🔍 Searching the web for relay status"):
+        assert mod._is_tool_progress(feed), feed

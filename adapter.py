@@ -38,6 +38,7 @@ import json
 import logging
 import os
 import random
+import re
 import shutil
 import time
 from datetime import datetime, timezone
@@ -234,10 +235,93 @@ def _gateway_notice_kind(content: str) -> Optional[str]:
     return None
 
 
+# The emoji a tool-progress line starts with ("✍️ Writing …", "💻 Running …", "📚 Reading skill …"): the tools' own
+# emoji (tools.registry) plus the gateway's defaults for tools without one.
+_TOOL_PROGRESS_EMOJI_FALLBACK = frozenset(
+    "⚙️ ⚡ ✍️ 💻 📚 📖 📝 📄 📋 🔍 🔎 🌐 🧠 🧩 🧪 🧭 🔧 🔗 🔖 🔐 🔊 🔀 💬 💡 🖥️ 🖱️ 🖼️ 🪟 🎬 🎨 🎛 👁️ 🐍 🐦 ⏰ ❓".split())
+
+
+# The words after the emoji (gateway/run_turn_progress.py): a friendly verb ("Running", "Reading skill", "Searching
+# the web") or the tool's own name ("skill_manage...", "browser_exec: \"…\"", "terminal(command)"). These English
+# verbs back up the catalog's ``display.verb.*`` when Hermes' helpers cannot be read.
+_TOOL_PROGRESS_VERBS_FALLBACK = (
+    "Searching the web", "Reading", "Browsing", "Clicking", "Typing", "Writing", "Editing", "Searching files",
+    "Running", "Generating", "Looking at the image", "Searching past sessions", "Listing skills", "Updating skill",
+    "Delegating", "Scheduling", "Asking", "Updating memory", "Updating tasks")
+
+
+def _tool_progress_words() -> tuple:
+    """(emoji, verbs, tool names) a tool-progress line is made of: the tools' own emoji (tools.registry) plus the
+    gateway's defaults, the verbs in the gateway's language plus the English ones, and the registered tool names."""
+    emoji: set = set(_TOOL_PROGRESS_EMOJI_FALLBACK)
+    verbs: set = set(_TOOL_PROGRESS_VERBS_FALLBACK)
+    names: set = set()
+    with contextlib.suppress(Exception):
+        from tools.registry import registry
+        names.update(registry.get_all_tool_names() if hasattr(registry, "get_all_tool_names")
+                     else list(getattr(registry, "_tools", {})))
+        for name in names:
+            found = registry.get_emoji(name, default="")
+            if found:
+                emoji.add(found)
+    with contextlib.suppress(Exception):
+        from agent.display import _TOOL_VERB_TOOLS, get_tool_verb
+        names.update(_TOOL_VERB_TOOLS)
+        for name in _TOOL_VERB_TOOLS:
+            verb = get_tool_verb(name)
+            if verb:
+                verbs.add(str(verb))
+    return frozenset(emoji), tuple(sorted(verbs, key=len, reverse=True)), frozenset(names)
+
+
+_TOOL_NAME_LINE = re.compile(r'[a-z][a-z0-9_]*(?:: "|\.\.\.|\u2026|\(|$)')
+
+
+def _is_tool_line(rest: str, verbs: tuple, names: frozenset) -> bool:
+    """``rest`` (the text after the emoji) starts with a progress verb, or is in the gateway's tool-name shapes
+    (``tool: "preview"``, ``tool...``, ``tool(keys)``): what the gateway writes, and not what a reply like
+    "❓ Which branch?" or "🔍 Looking into it" says."""
+    if any(rest == verb or rest.startswith(verb + " ") or rest.startswith(verb + "\"") for verb in verbs):
+        return True
+    if _TOOL_NAME_LINE.match(rest):
+        name = re.match(r"[a-z0-9_]*", rest).group(0)
+        # A registered tool, or a snake_case name the registry did not list (a plugin's or an MCP server's tool).
+        return name in names or "_" in name or rest != name
+    return False
+
+
+def _is_tool_progress(content: str) -> bool:
+    """The gateway's tool-progress bubble (display.tool_progress): every line is "<tool emoji> <verb or tool>…", or a
+    fenced command block under such a line. Config can only turn it off per platform, so groups drop it here. A line
+    whose words are not a progress verb or a tool name is a reply, so the message goes out."""
+    lines = [line.strip() for line in (content or "").splitlines() if line.strip()]
+    if not lines:
+        return False
+    emoji, verbs, names = _tool_progress_words()
+    in_fence = False
+    saw_tool_line = False
+    for line in lines:
+        if line.startswith("```"):
+            if not saw_tool_line:
+                return False
+            in_fence = not in_fence
+            continue
+        if in_fence:
+            continue
+        head, _, rest = line.partition(" ")
+        rest = rest.strip()
+        if head not in emoji or not rest or not _is_tool_line(rest, verbs, names):
+            return False
+        saw_tool_line = True
+    return saw_tool_line and not in_fence
+
+
 def _outbound_for_notice(chat: Dict[str, Any], content: str) -> Optional[str]:
     """Never post a gateway notice (silence warning, internal/tool error) into a Ghostly chat: groups, peers and
     contacts get nothing; the owner's DM gets a short line instead. Returns the text to send ("" = drop), or None when
     ``content`` is a normal reply."""
+    if chat.get("role") == "group" and _is_tool_progress(content):
+        return ""  # a group gets the short status lines only, never the tool feed
     kind = _gateway_notice_kind(content)
     if kind is None:
         return None
