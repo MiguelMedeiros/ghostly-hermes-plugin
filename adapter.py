@@ -202,6 +202,12 @@ def _outbound_for_notice(chat: Dict[str, Any], content: str) -> Optional[str]:
     return OWNER_SILENCE_REPLY if kind == "silence" else OWNER_ERROR_REPLY
 
 
+def _notice_for_log(content: str) -> str:
+    """The first line of a kept-out notice, cut short: enough to tell which notice it was, not the commands it carries."""
+    lines = (content or "").strip().splitlines()
+    return lines[0][:120] if lines else ""
+
+
 def _is_silence_fallback(chat: Dict[str, Any], content: str) -> bool:
     """The gateway's warning for a bare NO_REPLY, in a chat where NO_REPLY is the instructed answer."""
     return chat.get("role", "contact") != "owner" and _gateway_notice_kind(content) == "silence"
@@ -905,8 +911,8 @@ class GhostlyAdapter(BasePlatformAdapter):
         chat = self.chats.get(chat_id) or {"role": "group" if chat_id.startswith(GROUP_PREFIX) else "contact"}
         replacement = _outbound_for_notice(chat, content)
         if replacement is not None:
-            logger.warning("[ghostly] gateway notice kept out of %s (%s): %s", chat_id,
-                           "dropped" if not replacement else f"sent {replacement!r} instead", content.strip()[:300])
+            logger.info("[ghostly] gateway notice kept out of %s (%s): %s", chat_id,
+                        "dropped" if not replacement else f"sent {replacement!r} instead", _notice_for_log(content))
             if not replacement:
                 return SendResult(success=True)
             content = replacement
@@ -924,7 +930,7 @@ class GhostlyAdapter(BasePlatformAdapter):
         chat = self.chats.get(chat_id) or {"role": "group" if chat_id.startswith(GROUP_PREFIX) else "contact"}
         replacement = _outbound_for_notice(chat, content)
         if replacement is not None:
-            logger.warning("[ghostly] gateway notice kept out of an edit in %s: %s", chat_id, content.strip()[:300])
+            logger.info("[ghostly] gateway notice kept out of an edit in %s: %s", chat_id, _notice_for_log(content))
             if not replacement:
                 return SendResult(success=True, message_id=message_id)
             content = replacement

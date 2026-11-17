@@ -6,6 +6,7 @@ Run with ``tests/run`` from the repo root: it finds the Hermes Agent's Python an
 import asyncio
 import importlib.util
 import json
+import logging
 import os
 import stat
 import sys
@@ -453,6 +454,27 @@ def test_gateway_notices_never_reach_a_ghostly_chat_and_the_owner_gets_a_short_l
     assert mod.OWNER_ERROR_REPLY in "".join(sent[1]) and FAILED_TURN_NOTICE not in "".join(sent[1])
     assert run(adapter.send("group:G1", "a normal reply")).success      # normal replies are untouched
     assert "a normal reply" in "".join(calls(tmp)[-1])
+
+
+def test_a_notice_kept_out_of_a_chat_is_logged_at_info_as_one_short_line(env, caplog):
+    """Keeping a notice out of a group or a peer is the policy working, not a fault: it stays out of errors.log
+    (WARNING and up) and the log gets only the notice's first line, cut short, not the commands it carries."""
+    mod, _, _ = env
+    adapter, _ = make_adapter(mod)
+    from agent.turn_failure_copy import FAILED_TURN_NOTICE
+    notice = "⚡ Interrupting current task " + "x" * 200 + "\nghostly group typing G1 --secret-ish-detail"
+    caplog.set_level(logging.DEBUG, logger=mod.__name__)
+    for text in (notice, FAILED_TURN_NOTICE):
+        assert run(adapter.send("group:G1", text)).success
+        assert run(adapter.send("PEERDM", text)).success
+        assert run(adapter.edit_message("group:G1", "m9", text)).success
+    assert run(adapter.send("OWNERDM", FAILED_TURN_NOTICE)).success
+    kept = [r for r in caplog.records if "kept out of" in r.getMessage()]
+    assert len(kept) == 7
+    assert all(r.levelno == logging.INFO for r in kept)
+    for r in kept:
+        assert "--secret-ish-detail" not in r.getMessage() and "\n" not in r.getMessage()
+        assert "x" * 121 not in r.getMessage()
 
 
 def test_unaddressed_group_messages_and_peer_dms_may_stay_silent(env):
