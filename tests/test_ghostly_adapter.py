@@ -1129,6 +1129,10 @@ def test_malformed_allowlist_entries_are_dropped_and_the_rest_keeps_working(env,
     run(adapter._handle_event(dm("OWNERDM", "hi")))
     assert [e.text.split("] ", 1)[-1] for e in captured] == ["owner talking", "@Hermes hi", "@Hermes ops", "new group", "hi"]
     assert json.loads(chats.read_text())["group:G2"]["members"]["OWNERKEY"].get("owner") is True
+    # Saving the new group leaves the owner's malformed entries in the file as written (only memory ignores them).
+    on_disk = json.loads(chats.read_text())
+    assert on_disk["BADDM"] == "owner" and on_disk["group:G1"]["members"]["BOTKEY"] == "Peer"
+    assert on_disk["group:G3"]["members"] == ["OWNERKEY"]
     assert "BADDM" not in adapter.config.extra["allow_from"]
     # One error line per dropped entry, naming it.
     errors = [r.getMessage() for r in caplog.records if r.name == mod.logger.name and r.levelname == "ERROR"]

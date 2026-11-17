@@ -472,6 +472,7 @@ class GhostlyAdapter(BasePlatformAdapter):
         self.media_dir = self.state_dir / "media"
         self.chats: Dict[str, dict] = {}
         self._chats_mtime = 0.0
+        self._chats_on_disk: Dict[str, Any] = {}   # chats.json as last read, malformed entries included
         self.owner_keys_file = Path(os.path.expanduser(
             str(extra.get("owner_keys_file") or (self.state_dir / "owner_keys.txt"))))
         self._listed_owners: frozenset = frozenset()
@@ -509,15 +510,16 @@ class GhostlyAdapter(BasePlatformAdapter):
         chats = {}
         for cid, chat in data.items():
             if not isinstance(chat, dict):
-                logger.error("[ghostly] %s: chat %s is not an object; ignoring it", self.chats_file, cid)
+                logger.error("[ghostly] %s: chat %s is not an object; ignoring it", self.chats_file, str(cid)[:18])
                 continue
             members = chat.get("members")
             if members is not None and not isinstance(members, dict):
-                logger.error("[ghostly] %s: members of %s is not an object; ignoring them", self.chats_file, cid)
+                logger.error("[ghostly] %s: members of %s is not an object; ignoring them", self.chats_file, str(cid)[:18])
                 chat = {k: v for k, v in chat.items() if k != "members"}
             elif members:
                 for key in [k for k, m in members.items() if not isinstance(m, dict)]:
-                    logger.error("[ghostly] %s: member %s of %s is not an object; ignoring it", self.chats_file, key, cid)
+                    logger.error("[ghostly] %s: member %s of %s is not an object; ignoring it", self.chats_file, str(key)[:8],
+                                 str(cid)[:18])
                 chat = {**chat, "members": {k: m for k, m in members.items() if isinstance(m, dict)}}
             chats[cid] = chat
         return chats
@@ -526,20 +528,21 @@ class GhostlyAdapter(BasePlatformAdapter):
         try:
             mtime = self.chats_file.stat().st_mtime
         except FileNotFoundError:
-            self.chats, self._chats_mtime = {}, 0.0
+            self.chats, self._chats_mtime, self._chats_on_disk = {}, 0.0, {}
             self._publish_allowlist()
             return
         if mtime == self._chats_mtime:
             return
         try:
-            data = self._valid_chats(json.loads(self.chats_file.read_text()))
+            raw = json.loads(self.chats_file.read_text())
+            data = self._valid_chats(raw)
         except ValueError as exc:
             logger.error("[ghostly] %s is not valid JSON (%s); keeping the previous allowlist", self.chats_file, exc)
             return
         if not isinstance(data, dict):
             logger.error("[ghostly] %s is not a JSON object of chats; keeping the previous allowlist", self.chats_file)
             return
-        self.chats, self._chats_mtime = data, mtime
+        self.chats, self._chats_mtime, self._chats_on_disk = data, mtime, raw
         self._publish_allowlist()
 
     def _save_chats(self) -> None:
@@ -555,7 +558,9 @@ class GhostlyAdapter(BasePlatformAdapter):
             return
         self.state_dir.mkdir(parents=True, exist_ok=True)
         tmp = self.chats_file.with_suffix(".tmp")
-        tmp.write_text(json.dumps(self.chats, ensure_ascii=False, indent=2))
+        # The file as it was read plus the chats added since: an entry _valid_chats left out stays as the owner wrote it.
+        data = {**self._chats_on_disk, **{cid: c for cid, c in self.chats.items() if cid not in self._chats_on_disk}}
+        tmp.write_text(json.dumps(data, ensure_ascii=False, indent=2))
         os.chmod(tmp, 0o600)
         tmp.replace(self.chats_file)
         self._chats_mtime = self.chats_file.stat().st_mtime
