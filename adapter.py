@@ -45,7 +45,7 @@ import threading
 import time
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, Iterable, List, Optional, Tuple
 
 from gateway.config import Platform, PlatformConfig
 from gateway.platforms._shared import get_scoped_secret as _get_scoped_secret, send_error
@@ -660,6 +660,8 @@ class GhostlyAdapter(BasePlatformAdapter):
         self._lanes: Dict[tuple, asyncio.Task] = {}
         # profile -> seqs still in a lane (the cursor stays before the oldest) / the last seq read from the stream.
         self._held: Dict[Optional[str], set] = {}
+        # profile -> seqs above that cursor already handled, kept next to it so a restart's replay skips them.
+        self._done: Dict[Optional[str], set] = {}
         self._last_seq: Dict[Optional[str], int] = {}
         self._file_saves = asyncio.Semaphore(FILE_SAVES_AT_ONCE)
 
@@ -842,15 +844,24 @@ class GhostlyAdapter(BasePlatformAdapter):
 
     def _read_cursor(self, profile: Optional[str] = None) -> Optional[int]:
         try:
-            return int(self._cursor_path(profile).read_text().strip())
+            return int(self._cursor_path(profile).read_text().split("\n")[0].strip())
         except (FileNotFoundError, ValueError):
             return None
 
-    def _write_cursor(self, seq: int, profile: Optional[str] = None) -> None:
+    def _read_done(self, profile: Optional[str] = None) -> set:
+        """The cursor file's second line: seqs above it already handled (none in a file of one number)."""
+        try:
+            lines = self._cursor_path(profile).read_text().split("\n")
+            return {int(s) for s in lines[1].split()} if len(lines) > 1 else set()
+        except (FileNotFoundError, ValueError):
+            return set()
+
+    def _write_cursor(self, seq: int, profile: Optional[str] = None, done: Iterable[int] = ()) -> None:
         self.state_dir.mkdir(parents=True, exist_ok=True)
         path = self._cursor_path(profile)
         tmp = path.with_suffix(".tmp")
-        tmp.write_text(str(seq))
+        above = " ".join(str(s) for s in sorted(done))
+        tmp.write_text(f"{seq}\n{above}" if above else str(seq))
         tmp.replace(path)
 
     async def _status_seq(self, profile: Optional[str] = None) -> Optional[int]:
@@ -885,6 +896,8 @@ class GhostlyAdapter(BasePlatformAdapter):
                     delay = min(delay * 2, RETRY_MAX)
                     continue
                 self._write_cursor(since, profile)
+            done = self._done.setdefault(profile, set())
+            done.update(self._read_done(profile))
             binary = _ghostly_bin()
             started = time.monotonic()
             reason = None
@@ -908,11 +921,17 @@ class GhostlyAdapter(BasePlatformAdapter):
                         continue
                     seq = event["seq"] if isinstance(event.get("seq"), int) else None
                     lane = (profile, _event_chat(event))
-                    if lane[1] and (lane in self._lanes or _has_file(event)):
+                    if seq is not None and seq in done:
+                        # Handled before a restart while a file held the cursor below it: not a second turn.
+                        logger.debug("[ghostly] event %s%s was already handled, skipping its replay", seq,
+                                     f" ({profile})" if profile else "")
+                    elif lane[1] and (lane in self._lanes or _has_file(event)):
                         # A file can take minutes to save: it and that chat's next events wait, the stream goes on.
                         self._queue_in_lane(lane, event, seq)
                     else:
                         await self._handle_safely(event, profile)
+                        if seq is not None:
+                            done.add(seq)
                     if seq is not None:
                         self._last_seq[profile] = seq
                         self._save_cursor(profile)
@@ -960,16 +979,21 @@ class GhostlyAdapter(BasePlatformAdapter):
                 del self._lanes[lane]
             if seq is not None and not t.cancelled():
                 held.discard(seq)
+                self._done.setdefault(profile, set()).add(seq)
                 self._save_cursor(profile)
 
         task.add_done_callback(done)
 
     def _save_cursor(self, profile: Optional[str]) -> None:
-        """The last seq read, or the one before the oldest event still waiting in a lane."""
+        """The last seq read, or the one before the oldest event still waiting in a lane; then the seqs above it
+        already handled, which a restart replays with it and skips."""
         held = self._held.get(profile)
+        done = self._done.setdefault(profile, set())
         seq = min(held) - 1 if held else self._last_seq.get(profile)
-        if seq is not None:
-            self._write_cursor(seq, profile)
+        if seq is None:
+            return
+        done.difference_update([s for s in done if s <= seq])
+        self._write_cursor(seq, profile, done)
 
     # ---- inbound ---------------------------------------------------------------------------------
 
