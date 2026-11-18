@@ -28,7 +28,8 @@ exception: the owner's tap on, or reply quoting, a message another member wrote 
 for that member, so it starts no turn here unless it mentions this agent.
 
 More profiles: a chat entry with ``"profile": "<name>"`` (or ``extra.profiles: [<name>]``) makes that Ghostly profile
-listened to as well (``ghostly -p <name>``), with its own cursor; the chat is read and answered through it. An optional
+listened to as well (``ghostly -p <name>``), with its own cursor; the chat is read and answered through it, within a
+few seconds of being added to the file (no restart). An optional
 ``"note"`` is added to its role note (for example the scope allowed in a test chat).
 """
 
@@ -71,6 +72,8 @@ SEEN_REACTS_AT_ONCE = 2
 SEEN_REACTS_QUEUED = 16
 # While the daemon is down each failed listen is one cheap CLI spawn; a low cap reads the first message after it is back soon.
 RETRY_INITIAL, RETRY_MAX = 2.0, 15.0
+# How often chats.json is checked for a change (a stat) while inbound is on: a chat in a new profile is listened to then.
+CHATS_CHECK_SECONDS = 5.0
 SECRET_GUARD_EXIT = 5
 _FALLBACK_BIN = os.path.expanduser("~/.local/bin/ghostly")
 GROUP_PREFIX = "group:"
@@ -643,6 +646,7 @@ class GhostlyAdapter(BasePlatformAdapter):
         self._listen_task: Optional[asyncio.Task] = None
         self._listen_proc: Optional[asyncio.subprocess.Process] = None
         self._profile_tasks: List[asyncio.Task] = []
+        self._followed: set = set()     # the extra profiles a listen loop runs for
         self._profile_procs: Dict[str, asyncio.subprocess.Process] = {}
         self._dedup = MessageDeduplicator(max_size=4000, ttl_seconds=3600)
         self._typing_at: Dict[str, float] = {}
@@ -812,7 +816,8 @@ class GhostlyAdapter(BasePlatformAdapter):
         self._mark_connected()
         if self.inbound:
             self._listen_task = asyncio.create_task(self._listen_loop())
-            self._profile_tasks = [asyncio.create_task(self._listen_loop(p)) for p in self._listened_profiles()]
+            self._followed, self._profile_tasks = set(), [asyncio.create_task(self._watch_chats())]
+            self._follow_new_profiles()
             self._wire_plugin_handlers(None)
         home = _home_chat()
         logger.info("[ghostly] Ready (inbound %s, %d chats, home chat %s)",
@@ -834,8 +839,26 @@ class GhostlyAdapter(BasePlatformAdapter):
         await cancel_task(self._listen_task)
         for task in [*self._profile_tasks, *self._lanes.values()]:
             await cancel_task(task)
-        self._listen_task, self._profile_tasks = None, []
+        self._listen_task, self._profile_tasks, self._followed = None, [], set()
         self._mark_disconnected()
+
+    def _follow_new_profiles(self) -> None:
+        """Start a listen loop for each extra profile that has none yet (one a chat added to chats.json names)."""
+        for profile in self._listened_profiles():
+            if profile not in self._followed:
+                self._followed.add(profile)
+                self._profile_tasks.append(asyncio.create_task(self._listen_loop(profile)))
+
+    async def _watch_chats(self) -> None:
+        """chats.json is read again when it changes, without waiting for a message of the default profile: a chat added
+        in a profile no other entry named is listened to within CHATS_CHECK_SECONDS, not only after a restart."""
+        while self._running:
+            await asyncio.sleep(CHATS_CHECK_SECONDS)
+            try:
+                self._load_chats()
+                self._follow_new_profiles()
+            except Exception:
+                logger.exception("[ghostly] could not read %s again", self.chats_file)
 
     def _cursor_path(self, profile: Optional[str] = None) -> Path:
         return self.cursor_file if not profile else self.state_dir / f"cursor-{profile}"
@@ -1325,6 +1348,7 @@ class GhostlyAdapter(BasePlatformAdapter):
 
     async def send(self, chat_id: str, content: str, reply_to: Optional[str] = None,
                    metadata: Optional[Dict[str, Any]] = None) -> SendResult:
+        self._load_chats()  # a stat when unchanged: an entry added since picks the chat's profile and role
         chat = self.chats.get(chat_id) or {"role": "group" if chat_id.startswith(GROUP_PREFIX) else "contact"}
         replacement = _outbound_for_notice(chat, content)
         if replacement is not None:
@@ -1345,6 +1369,7 @@ class GhostlyAdapter(BasePlatformAdapter):
     async def edit_message(self, chat_id: str, message_id: str, content: str, *, finalize: bool = False) -> SendResult:
         """edit/1 (`ghostly edit` / `group edit`): the other side sees the text replaced, marked edited.
         A text past one message or a missing id returns success=False, so the gateway sends anew."""
+        self._load_chats()
         chat = self.chats.get(chat_id) or {"role": "group" if chat_id.startswith(GROUP_PREFIX) else "contact"}
         replacement = _outbound_for_notice(chat, content)
         if replacement is not None:
@@ -1390,6 +1415,7 @@ class GhostlyAdapter(BasePlatformAdapter):
         return result
 
     async def _file_result(self, chat_id: str, path: str, caption: Optional[str], voice: bool = False) -> SendResult:
+        self._load_chats()
         if caption and caption.strip():
             text = await _send_text(chat_id, caption)
             if text.get("error"):
