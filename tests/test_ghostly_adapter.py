@@ -1172,6 +1172,36 @@ def test_a_chat_added_in_a_new_profile_while_running_is_listened_to_and_answered
     assert ["send", "BHCHAT"] not in [c[:2] for c in calls(tmp)]
 
 
+def test_a_chats_json_left_invalid_is_logged_once_not_at_every_check(env, monkeypatch, caplog):
+    """The file is checked every CHATS_CHECK_SECONDS and before each send: one that stays invalid (an edit left half
+    done) is one error until it changes again, not a line per check. A new bad version is logged again."""
+    mod, tmp, chats = env
+    monkeypatch.setattr(mod, "CHATS_CHECK_SECONDS", 0.02, raising=False)
+    (tmp / "events.jsonl").write_text("")
+    adapter, _ = make_adapter(mod)
+    chats.write_text("{ not json")
+
+    async def scenario():
+        await adapter.connect()
+        await asyncio.sleep(0.3)                        # ~15 checks
+        await adapter.send("OWNERDM", "hello")
+        chats.write_text("[ still not json")
+        os.utime(chats, (time.time() + 5, time.time() + 5))
+        await asyncio.sleep(0.2)
+        kept = "OWNERDM" in adapter.chats               # the previous allowlist is kept meanwhile
+        chats.write_text(json.dumps({"NEWDM": {"label": "new", "role": "contact"}}))
+        os.utime(chats, (time.time() + 10, time.time() + 10))
+        await asyncio.sleep(0.2)
+        await adapter.disconnect()
+        return kept
+
+    caplog.set_level(logging.ERROR, logger=mod.logger.name)
+    assert run(scenario())
+    bad = [r for r in caplog.records if "not valid JSON" in r.getMessage()]
+    assert len(bad) == 2
+    assert list(adapter.chats) == ["NEWDM"]             # the file fixed is read again
+
+
 def _approval_prompt(chat_id, session_key="sk1"):
     from gateway.platforms.base import ExecApprovalPrompt
     return ExecApprovalPrompt(chat_id=chat_id, session_key=session_key, text="⚠️ run?\n\nrm -rf x\n\nreason",
