@@ -638,6 +638,7 @@ class GhostlyAdapter(BasePlatformAdapter):
         self._media_pruned_at = 0.0
         self.chats: Dict[str, dict] = {}
         self._chats_mtime = 0.0
+        self._chats_bad_mtime = 0.0                # chats.json's version last found unreadable (logged once)
         self._chats_on_disk: Dict[str, Any] = {}   # chats.json as last read, malformed entries included
         self.owner_keys_file = Path(os.path.expanduser(
             str(extra.get("owner_keys_file") or (self.state_dir / "owner_keys.txt"))))
@@ -700,15 +701,18 @@ class GhostlyAdapter(BasePlatformAdapter):
             self.chats, self._chats_mtime, self._chats_on_disk = {}, 0.0, {}
             self._publish_allowlist()
             return
-        if mtime == self._chats_mtime:
+        if mtime in (self._chats_mtime, self._chats_bad_mtime):
+            # Unchanged; or still the version that could not be read, said once (it is checked every few seconds).
             return
         try:
             raw = json.loads(self.chats_file.read_text())
             data = self._valid_chats(raw)
         except ValueError as exc:
+            self._chats_bad_mtime = mtime
             logger.error("[ghostly] %s is not valid JSON (%s); keeping the previous allowlist", self.chats_file, exc)
             return
         if not isinstance(data, dict):
+            self._chats_bad_mtime = mtime
             logger.error("[ghostly] %s is not a JSON object of chats; keeping the previous allowlist", self.chats_file)
             return
         self.chats, self._chats_mtime, self._chats_on_disk = data, mtime, raw
