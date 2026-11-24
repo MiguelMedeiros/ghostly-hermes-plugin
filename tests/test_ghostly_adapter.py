@@ -1142,6 +1142,36 @@ def test_a_profile_named_by_an_allowlisted_chat_is_listened_to_without_config(en
     assert mod._pargs("BHCHAT") == ["-p", "testing"] and mod._pargs("OWNERDM") == []
 
 
+def test_a_chat_added_in_a_new_profile_while_running_is_listened_to_and_answered_through_it(env, monkeypatch):
+    """chats.json is read again without a restart: a chat added there in a profile no entry named yet is listened to
+    with ``-p`` within CHATS_CHECK_SECONDS, and a send to it goes out through that profile, not the default one."""
+    mod, tmp, chats = env
+    monkeypatch.setattr(mod, "CHATS_CHECK_SECONDS", 0.05, raising=False)
+    (tmp / "events.jsonl").write_text("")
+    (tmp / "events-testing.jsonl").write_text(json.dumps(dm("BHCHAT", "scenario 1") | {"seq": 7}) + "\n")
+    adapter, captured = make_adapter(mod)
+
+    async def scenario():
+        await adapter.connect()
+        await asyncio.sleep(0.2)
+        _with_tester(chats)                             # added while the gateway runs
+        sent = await adapter.send("BHCHAT", "hello")
+        for _ in range(100):
+            await asyncio.sleep(0.05)
+            if captured:
+                break
+        loops = len(adapter._profile_tasks)            # the chats.json check and one loop for testing, however many checks
+        await adapter.disconnect()
+        return sent, loops
+
+    sent, loops = run(scenario())
+    assert sent.success and loops == 2
+    assert [e.text for e in captured] == ["scenario 1"]
+    assert ["-p", "testing", "listen"] in [c[:3] for c in calls(tmp)]
+    assert ["-p", "testing", "send", "BHCHAT"] in [c[:4] for c in calls(tmp)]
+    assert ["send", "BHCHAT"] not in [c[:2] for c in calls(tmp)]
+
+
 def _approval_prompt(chat_id, session_key="sk1"):
     from gateway.platforms.base import ExecApprovalPrompt
     return ExecApprovalPrompt(chat_id=chat_id, session_key=session_key, text="⚠️ run?\n\nrm -rf x\n\nreason",
