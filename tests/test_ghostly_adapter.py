@@ -4,6 +4,7 @@ Run with ``tests/run`` from the repo root: it finds the Hermes Agent's Python an
 ``HERMES_AGENT_DIR`` points at the Hermes Agent checkout (default ``~/.hermes/hermes-agent``).
 """
 import asyncio
+import gc
 import importlib.util
 import json
 import logging
@@ -11,6 +12,7 @@ import os
 import stat
 import sys
 import time
+import warnings
 from pathlib import Path
 
 import pytest
@@ -104,11 +106,32 @@ def grp(gid, member, text, **extra):
 
 
 def run(coro):
+    """Run one step on a fresh loop. What the step left running is settled before the loop closes: the 👀 workers are
+    awaited (their reacts belong to this step's calls log) and any other task is cancelled, as asyncio.run does. A task
+    left pending on a closed loop is closed later by the garbage collector, in the middle of another test."""
     loop = asyncio.new_event_loop()
     try:
         return loop.run_until_complete(coro)
     finally:
-        loop.close()
+        try:
+            _settle(loop)
+        finally:
+            loop.close()
+
+
+def _settle(loop):
+    def react_workers():
+        return [t for t in asyncio.all_tasks(loop)
+                if getattr(t.get_coro(), "__qualname__", "") == "GhostlyAdapter._react_worker"]
+
+    while workers := react_workers():
+        loop.run_until_complete(asyncio.gather(*workers, return_exceptions=True))
+    rest = asyncio.all_tasks(loop)
+    for task in rest:
+        task.cancel()
+    if rest:
+        loop.run_until_complete(asyncio.gather(*rest, return_exceptions=True))
+    loop.run_until_complete(loop.shutdown_asyncgens())
 
 
 def test_allowlist_file_feeds_gateway_authorization(env):
@@ -313,6 +336,46 @@ def test_a_few_owner_messages_all_get_a_seen_reaction_and_a_failed_react_breaks_
     assert [c[2] for c in reacts(tmp)] == ["ok1", "ok2"]   # the refused ones exit before the fake logs them
     assert len((tmp / "react-peaks").read_text().split()) == 4
     assert not adapter._seen_pending and not adapter._seen_tasks
+
+
+def test_a_seen_reaction_left_queued_by_a_step_never_lands_in_a_later_tests_calls(env, monkeypatch):
+    """Most steps read owner messages and return without awaiting their 👀, leaving the react workers to run(). Those
+    must be done before its loop closes. A worker still waiting there stays alive until the garbage collector closes
+    it, at a random point of a later test; that close is caught as an error and the worker runs the next queued react
+    in whatever loop is running then, with that test's FAKE_LOG."""
+    mod, tmp, _ = env
+    monkeypatch.setattr(mod, "SEEN_REACTS_AT_ONCE", 1)      # one worker, so reacts are still queued behind it
+    real_cli = mod._cli
+    started = []                                            # (FAKE_LOG, message id) of each react CLI started
+
+    async def cli(args, *a, **kw):
+        started.append((os.environ["FAKE_LOG"], args[-2]))
+        return await real_cli(args, *a, **kw)
+
+    monkeypatch.setattr(mod, "_cli", cli)
+    adapter, _ = make_adapter(mod)
+
+    async def read_all():
+        for n in range(3):
+            await adapter._handle_event(owner_dm(n))
+
+    # pytest keeps a test's warnings, and what they point at, until the test ends: that is what kept a leaked worker
+    # alive into the next test. Here the step's warnings are let go at once, as at the end of a test.
+    with warnings.catch_warnings(record=True):
+        run(read_all())
+    later = tmp / "later-test-calls.log"
+    later.write_text("")
+    monkeypatch.setenv("FAKE_LOG", str(later))              # what the next test's env fixture does
+    del adapter, read_all                                   # and the step's references end with it
+
+    async def a_later_test():
+        gc.collect()
+        await asyncio.sleep(0.3)
+
+    run(a_later_test())
+    assert [mid for log, mid in started if log == str(later)] == []    # the CLI is killed with its transport, mostly
+    assert sorted(c[2] for c in reacts(tmp)) == ["m0", "m1", "m2"]     # each one ran in the step that queued it
+    assert later.read_text() == ""
 
 
 def list_owner_keys(tmp, *keys, mtime=None):
