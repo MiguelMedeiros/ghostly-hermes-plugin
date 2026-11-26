@@ -927,7 +927,7 @@ class GhostlyAdapter(BasePlatformAdapter):
             done.update(self._read_done(profile))
             binary = _ghostly_bin()
             started = time.monotonic()
-            reason = None
+            reason = proc = None
             try:
                 proc = await asyncio.create_subprocess_exec(
                     binary, *pargs, "listen", "--type", "message.received", "--type", "group.message",
@@ -945,6 +945,8 @@ class GhostlyAdapter(BasePlatformAdapter):
                     try:
                         event = json.loads(raw)
                     except ValueError:
+                        continue
+                    if not isinstance(event, dict):  # `5` or `null` parse too: every retry would replay it
                         continue
                     seq = event["seq"] if isinstance(event.get("seq"), int) else None
                     lane = (profile, _event_chat(event))
@@ -971,6 +973,15 @@ class GhostlyAdapter(BasePlatformAdapter):
             except Exception:
                 logger.exception("[ghostly] listen stream failed")
             finally:
+                if proc and proc.returncode is None:  # left on an error: the next round starts another listen
+                    with contextlib.suppress(ProcessLookupError):
+                        proc.terminate()
+                    try:
+                        await asyncio.wait_for(proc.wait(), 5)
+                    except asyncio.TimeoutError:
+                        with contextlib.suppress(ProcessLookupError):
+                            proc.kill()
+                        await proc.wait()
                 if reason and not reason.done():
                     reason.cancel()
             if time.monotonic() - started > 60:

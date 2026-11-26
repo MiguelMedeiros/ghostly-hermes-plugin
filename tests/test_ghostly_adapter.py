@@ -32,7 +32,8 @@ case "$1 $2" in
   "group show") cat "$dir/group.json";;
   "file save") shift 2; p=""; while [ $# -gt 0 ]; do [ "$1" = "--path" ] && p="$2"; shift; done; echo data > "$p"; echo '{"saved":true}';;
   "listen "*) if [ -f "$dir/listen-error" ]; then cat "$dir/listen-error" >&2; exit 1; fi
-             if [ -n "$prof" ]; then cat "$dir/events-$prof.jsonl"; else cat "$dir/events.jsonl"; fi;;
+             if [ -n "$prof" ]; then cat "$dir/events-$prof.jsonl"; else cat "$dir/events.jsonl"; fi
+             if [ -e "$dir/listen-stays" ]; then exec sleep 30; fi;;
   *) if [ "$1" = "send" ] && printf '%s' "$stdin" | grep -q SECRETSEED; then echo '{"error":{"code":"secret"}}'; exit 5; fi
      echo '{"messageId":"m1","delivery":"sent"}';;
 esac
@@ -674,6 +675,68 @@ def test_a_failing_listen_logs_the_clis_reason_and_retries_at_most_every_retry_m
     assert len(exits) == 10
     assert all(m == "[ghostly] listen exited with 1: daemon: socket closed (ECONNREFUSED)" for m in exits)
     assert waits[0] < mod.RETRY_MAX and max(waits) == mod.RETRY_MAX <= 15
+
+
+def test_a_json_line_that_is_not_an_object_is_skipped_and_the_stream_goes_on(env, caplog):
+    """``5``, ``[1,2]``, ``"text"`` or ``null`` parse as JSON: skipped like an unparsable line, not a failed stream that
+    every retry replays from the same cursor."""
+    mod, tmp, _ = env
+    (tmp / "listen-stays").write_text("")
+    lines = ["5", "[1,2]", '"text"', "null", json.dumps(dm("OWNERDM", "new") | {"seq": 42})]
+    (tmp / "events.jsonl").write_text("".join(line + "\n" for line in lines))
+    adapter, captured = make_adapter(mod)
+    adapter._running = True
+
+    async def one_round():
+        adapter._listen_task = asyncio.create_task(adapter._listen_loop())
+        for _ in range(100):
+            await asyncio.sleep(0.05)
+            if captured:
+                break
+        await adapter.disconnect()
+
+    run(one_round())
+    assert [e.text for e in captured] == ["new"] and adapter._read_cursor() == 42
+    assert not [r for r in caplog.records if "listen stream failed" in r.getMessage()]
+
+
+def test_a_listen_that_fails_while_reading_is_terminated_before_the_next_one_starts(env, monkeypatch):
+    """An error in the read loop (a cursor write on a full disk) must not leave that ``ghostly listen`` running: each
+    retry would add one more child and daemon client."""
+    mod, tmp, _ = env
+    monkeypatch.setattr(mod, "RETRY_INITIAL", 0.05)
+    (tmp / "listen-stays").write_text("")
+    (tmp / "events.jsonl").write_text(json.dumps(dm("OWNERDM", "new") | {"seq": 42}) + "\n")
+    adapter, _ = make_adapter(mod)
+    adapter._running = True
+
+    def full_disk(profile):
+        raise OSError(28, "No space left on device")
+
+    monkeypatch.setattr(adapter, "_save_cursor", full_disk)
+    procs = []
+
+    async def rounds():
+        task = asyncio.create_task(adapter._listen_loop())
+        try:
+            for _ in range(200):
+                await asyncio.sleep(0.02)
+                if adapter._listen_proc and adapter._listen_proc not in procs:
+                    procs.append(adapter._listen_proc)
+                if len(procs) >= 2:
+                    break
+            adapter._running = False
+            task.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await task
+            return [p.returncode is None for p in procs[:-1]]
+        finally:
+            for p in procs:
+                if p.returncode is None:
+                    p.kill()
+                    await p.wait()
+
+    assert run(rounds()) == [False]
 
 
 @pytest.mark.parametrize("trouble", ["status-busy", "status-no-events"])
