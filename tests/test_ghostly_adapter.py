@@ -11,6 +11,7 @@ import logging
 import os
 import stat
 import sys
+import threading
 import time
 import warnings
 from pathlib import Path
@@ -43,6 +44,13 @@ esac
 
 @pytest.fixture
 def env(tmp_path, monkeypatch):
+    yield from _env(tmp_path, monkeypatch)
+
+
+def _env(tmp_path, monkeypatch):
+    """The ``env`` fixture's body, a generator so a test can run its teardown itself. After the test it joins the
+    catalog warm-up threads the test's connect() (or a send) started: a daemon thread still parsing the locale
+    catalogs when its test ends runs on into the next test and slows it."""
     home = tmp_path / ".hermes"
     home.mkdir()
     monkeypatch.setenv("HERMES_HOME", str(home))
@@ -73,7 +81,15 @@ def env(tmp_path, monkeypatch):
         "group:G1": {"label": "dev", "name": "the dev group", "role": "group", "mentions_only": True,
                      "members": {"OWNERKEY": {"name": "Ana", "owner": True}, "BOTKEY": {"name": "Peer"}}},
     }))
-    return mod, tmp_path, chats
+    yield mod, tmp_path, chats
+    _join_notice_warmups(mod)
+
+
+def _join_notice_warmups(mod):
+    with mod._notice_warmups_lock:
+        threads = list(mod._notice_warmups.values())
+    for thread in threads:
+        thread.join(timeout=60)
 
 
 def make_adapter(mod, inbound=True, **extra):
@@ -609,6 +625,24 @@ def test_media_max_age_days_sets_the_bound_and_zero_keeps_everything(env):
     week, day = _media(adapter, "2-old-b.webm", 3), _media(adapter, "3-new-c.webm", 1)
     run(adapter.connect())
     assert not ancient.exists() and not week.exists() and day.exists()
+
+
+def test_no_catalog_warm_up_thread_outlives_the_connect_test_that_started_it(tmp_path, monkeypatch):
+    """connect() parses the locale catalogs in a daemon thread. The env fixture joins it when the test ends: left
+    running, it competed with the next test (a send test took 2-4 s after a connect test instead of 0.4 s alone)."""
+    fixture = _env(tmp_path, monkeypatch)
+    mod, _, _ = next(fixture)
+    warm = mod._warm_notice_catalogs
+
+    def slow_warm(home):          # still parsing when the test's own steps are done, as on a loaded machine
+        time.sleep(0.5)
+        warm(home)
+
+    monkeypatch.setattr(mod, "_warm_notice_catalogs", slow_warm)
+    assert run(make_adapter(mod, inbound=False)[0].connect()) is True
+    assert mod._notice_warmups, "connect() started no catalog warm-up"
+    next(fixture, None)           # the fixture's teardown, as pytest runs it after a test
+    assert [t for t in threading.enumerate() if t.name == "ghostly-notice-catalogs" and t.is_alive()] == []
 
 
 def test_send_routes_dm_and_group_and_chunks_long_text(env):
