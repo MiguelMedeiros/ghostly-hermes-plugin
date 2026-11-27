@@ -854,6 +854,109 @@ def test_a_restart_while_a_file_saves_does_not_replay_the_messages_already_handl
     assert [(e.source.chat_id, e.text) for e in captured] == [("OWNERDM", "deploy it now"), ("PEERDM", "")]
 
 
+def hold_file_saves(tmp):
+    """Make the fake's `file save <id>` wait until the test creates <tmp>/release-<id>."""
+    fake = tmp / "ghostly"
+    fake.write_text(fake.read_text().replace(
+        '"file save") shift 2;', '"file save") while [ ! -e "$dir/release-$3" ]; do sleep 0.05; done; shift 2;'))
+
+
+async def until(done, tries=200):
+    for _ in range(tries):
+        await asyncio.sleep(0.05)
+        if done():
+            break
+
+
+def test_events_handled_while_a_file_saves_do_not_rewrite_the_whole_cursor_file_each(env):
+    """While a file holds the cursor, each event handled meanwhile adds its seq to the cursor file in a few bytes. It
+    used to sort and rewrite every seq handled so far at every event, on the event loop: O(n^2) over a long hold."""
+    mod, tmp, _ = env
+    hold_file_saves(tmp)
+    n = 150
+    events = [dm("OWNERDM", "", file={"id": "F1", "name": "big.bin"}) | {"seq": 60}]
+    events += [dm("PEERDM", f"message {i}") | {"seq": 61 + i} for i in range(n)]
+    (tmp / "events.jsonl").write_text("".join(json.dumps(e) + "\n" for e in events))
+    adapter, captured = make_adapter(mod)
+    adapter._running = True
+    rewrites = []
+    real = adapter._write_cursor
+
+    def counting(seq, profile=None, done=()):
+        done = list(done)
+        rewrites.append(len(done))
+        real(seq, profile, done)
+
+    adapter._write_cursor = counting
+
+    async def scenario():
+        task = asyncio.create_task(adapter._listen_loop())
+        await until(lambda: len(captured) == n)
+        while_saving = (list(rewrites), adapter._read_cursor(), adapter._read_done())
+        (tmp / "release-F1").write_text("")
+        await until(lambda: len(captured) == n + 1)
+        await asyncio.sleep(0.05)
+        adapter._running = False
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        return while_saving
+
+    written, cursor, done = run(scenario())
+    assert (cursor, done) == (59, set(range(61, 61 + n)))      # the file still says exactly what was handled
+    assert len(written) <= 3 and sum(written) == 0, written    # the first cursor and the one before the file, no more
+    assert adapter._read_cursor() == 60 + n and adapter._read_done() == set()
+
+
+def test_a_restart_after_a_held_burst_replays_exactly_the_events_not_handled(env):
+    """Two files hold the cursor in turn while another chat's messages are handled. When the first file is saved, the
+    cursor moves to before the second one; a restart then hands over the second file and what arrived while down,
+    and none of the messages handled before it."""
+    mod, tmp, chats = env
+    table = json.loads(chats.read_text())
+    table["OTHERDM"] = {"label": "other", "name": "another agent", "role": "agent_peer"}
+    chats.write_text(json.dumps(table))
+    hold_file_saves(tmp)
+    events = [dm("OWNERDM", "", file={"id": "F1", "name": "one.bin"}) | {"seq": 60}]
+    events += [dm("OTHERDM", f"before {s}") | {"seq": s} for s in range(61, 100)]
+    events += [dm("PEERDM", "", file={"id": "F2", "name": "two.bin"}) | {"seq": 100}]
+    events += [dm("OTHERDM", f"after {s}") | {"seq": s} for s in range(101, 140)]
+    (tmp / "events.jsonl").write_text("".join(json.dumps(e) + "\n" for e in events))
+    turns = lambda seen: [(e.source.chat_id, e.text) for e in seen]
+    out = {}
+
+    async def scenario():
+        first, seen = make_adapter(mod)
+        first._running = True
+        first._listen_task = asyncio.create_task(first._listen_loop())
+        await until(lambda: len(seen) == 78)
+        (tmp / "release-F1").write_text("")
+        await until(lambda: len(seen) == 79)
+        await first.disconnect()                   # the gateway goes down while the second file is still being saved
+        out["first"] = turns(seen)
+        cursor, done = first._read_cursor(), first._read_done()
+        out["file"] = (cursor, done)
+        # The daemon replays from the cursor; one more message came in while the gateway was down.
+        later = [e for e in events if e["seq"] > cursor] + [dm("OTHERDM", "while down") | {"seq": 140}]
+        (tmp / "events.jsonl").write_text("".join(json.dumps(e) + "\n" for e in later))
+        second, seen = make_adapter(mod)
+        second._running = True
+        (tmp / "release-F2").write_text("")
+        second._listen_task = asyncio.create_task(second._listen_loop())
+        await until(lambda: len(seen) == 2)
+        await asyncio.sleep(0.2)
+        await second.disconnect()
+        out["second"] = turns(seen)
+        out["end"] = (second._read_cursor(), second._read_done())
+
+    run(scenario())
+    assert sorted(out["first"]) == sorted([("OWNERDM", "")] + [("OTHERDM", f"before {s}") for s in range(61, 100)]
+                                          + [("OTHERDM", f"after {s}") for s in range(101, 140)])
+    assert out["file"] == (99, set(range(101, 140)))
+    assert sorted(out["second"]) == [("OTHERDM", "while down"), ("PEERDM", "")]
+    assert out["end"] == (140, set())
+
+
 def test_gateway_notices_never_reach_a_ghostly_chat_and_the_owner_gets_a_short_line(env):
     """The gateway's silence warning (the one the gateway really produces, in any catalog language) and its other
     error notices stay in the log: groups and peers get nothing, the owner's DM gets "👀 seen" / a short error line."""

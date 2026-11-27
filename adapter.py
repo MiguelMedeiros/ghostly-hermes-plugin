@@ -667,6 +667,8 @@ class GhostlyAdapter(BasePlatformAdapter):
         self._held: Dict[Optional[str], set] = {}
         # profile -> seqs above that cursor already handled, kept next to it so a restart's replay skips them.
         self._done: Dict[Optional[str], set] = {}
+        # profile -> what its cursor file holds: [cursor, seqs on its second line, seqs appended since the last rewrite].
+        self._cursor_file: Dict[Optional[str], list] = {}
         self._last_seq: Dict[Optional[str], int] = {}
         self._file_saves = asyncio.Semaphore(FILE_SAVES_AT_ONCE)
 
@@ -923,6 +925,7 @@ class GhostlyAdapter(BasePlatformAdapter):
                     delay = min(delay * 2, RETRY_MAX)
                     continue
                 self._write_cursor(since, profile)
+                self._cursor_file.pop(profile, None)
             done = self._done.setdefault(profile, set())
             done.update(self._read_done(profile))
             binary = _ghostly_bin()
@@ -948,6 +951,7 @@ class GhostlyAdapter(BasePlatformAdapter):
                         continue
                     seq = event["seq"] if isinstance(event.get("seq"), int) else None
                     lane = (profile, _event_chat(event))
+                    handled = None
                     if seq is not None and seq in done:
                         # Handled before a restart while a file held the cursor below it: not a second turn.
                         logger.debug("[ghostly] event %s%s was already handled, skipping its replay", seq,
@@ -959,9 +963,10 @@ class GhostlyAdapter(BasePlatformAdapter):
                         await self._handle_safely(event, profile)
                         if seq is not None:
                             done.add(seq)
+                            handled = seq
                     if seq is not None:
                         self._last_seq[profile] = seq
-                        self._save_cursor(profile)
+                        self._save_cursor(profile, handled)
                 code = await proc.wait()
                 await asyncio.wait({reason}, timeout=2)  # a child it left behind may still hold the pipe open
                 why = reason.result() if reason.done() else ""
@@ -1007,20 +1012,44 @@ class GhostlyAdapter(BasePlatformAdapter):
             if seq is not None and not t.cancelled():
                 held.discard(seq)
                 self._done.setdefault(profile, set()).add(seq)
-                self._save_cursor(profile)
+                self._save_cursor(profile, seq)
 
         task.add_done_callback(done)
 
-    def _save_cursor(self, profile: Optional[str]) -> None:
+    def _save_cursor(self, profile: Optional[str], handled: Optional[int] = None) -> None:
         """The last seq read, or the one before the oldest event still waiting in a lane; then the seqs above it
-        already handled, which a restart replays with it and skips."""
+        already handled, which a restart replays with it and skips.
+
+        While a lane holds the cursor, ``handled`` (the seq just handled) is appended to the file's second line
+        instead of sorting and rewriting the whole set at every event. The file is rewritten, pruned, once the
+        cursor moved and at least as many seqs were appended as the last rewrite wrote, so a long hold costs a few
+        bytes per event. The file stays exact at every step: everything up to its cursor was handled, and so was every
+        seq on its second line."""
         held = self._held.get(profile)
         done = self._done.setdefault(profile, set())
         seq = min(held) - 1 if held else self._last_seq.get(profile)
         if seq is None:
             return
+        state = self._cursor_file.get(profile)
+        if held and state is not None:
+            at, size, appended = state
+            if handled is None or handled <= at:
+                return  # nothing new above the file's cursor: what it says is still true
+            if seq == at or appended < size:
+                sep = " " if size + appended else "\n"   # the second line exists once it holds a seq
+                try:
+                    fd = os.open(self._cursor_path(profile), os.O_WRONLY | os.O_APPEND)
+                    try:
+                        os.write(fd, f"{sep}{handled}".encode())
+                    finally:
+                        os.close(fd)
+                    state[2] += 1
+                    return
+                except OSError:
+                    pass  # the file is gone or unwritable: write it whole below
         done.difference_update([s for s in done if s <= seq])
         self._write_cursor(seq, profile, done)
+        self._cursor_file[profile] = [seq, len(done), 0]
 
     # ---- inbound ---------------------------------------------------------------------------------
 
